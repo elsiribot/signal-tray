@@ -1,13 +1,16 @@
 //! Local message history. signal-cli does not keep messages, so everything
 //! shown in the UI lives here.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
-use crate::model::{Author, ConversationId, DeliveryStatus, NewMessage, PeerId, Timestamp};
+use crate::model::{
+    Author, ConversationId, DeliveryStatus, NewMessage, PeerId, Timestamp, text_with_images,
+};
 
 /// How many messages of a conversation are loaded into the chat view.
 pub const CHAT_HISTORY_LIMIT: usize = 300;
@@ -45,6 +48,22 @@ CREATE INDEX IF NOT EXISTS messages_by_conversation ON messages (conversation, t
 CREATE INDEX IF NOT EXISTS messages_by_ts ON messages (ts);
 CREATE INDEX IF NOT EXISTS messages_by_expiry ON messages (expires_at)
     WHERE expires_at IS NOT NULL;
+-- Images of messages. Deleted together with their message.
+CREATE TABLE IF NOT EXISTS attachments (
+    id           INTEGER PRIMARY KEY,
+    message_id   INTEGER NOT NULL,
+    -- position among the message's images
+    idx          INTEGER NOT NULL,
+    content_type TEXT NOT NULL,
+    file_name    TEXT,
+    width        INTEGER,
+    height       INTEGER,
+    -- Signal's AttachmentPointer (protobuf), to download it with
+    pointer      BLOB NOT NULL,
+    -- name in the account's attachments directory, NULL until downloaded
+    file         TEXT,
+    UNIQUE (message_id, idx)
+);
 ";
 
 #[derive(Clone, Debug)]
@@ -62,10 +81,40 @@ pub struct StoredMessage {
     pub author_name: Option<String>,
     pub timestamp: Timestamp,
     pub body: String,
+    pub attachments: Vec<StoredAttachment>,
     /// Only set for our own messages.
     pub status: Option<DeliveryStatus>,
     pub edited: bool,
     pub deleted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AttachmentId(pub i64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredAttachment {
+    pub id: AttachmentId,
+    pub file_name: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// Name in the attachments directory; `None` until downloaded.
+    pub file: Option<String>,
+}
+
+/// An image that is yet to be downloaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissingAttachment {
+    pub id: AttachmentId,
+    pub content_type: String,
+    pub pointer: Vec<u8>,
+}
+
+/// What [`Store::purge_expired`] removed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Purged {
+    pub conversations: Vec<ConversationId>,
+    /// Downloaded images of the purged messages, to delete.
+    pub files: Vec<String>,
 }
 
 /// Whether a newly stored message counts towards the unread badge.
@@ -125,8 +174,9 @@ impl Store {
         Ok(())
     }
 
-    /// Stores a message and bumps its conversation. Returns `false` if the
-    /// message was already known (signal-cli can redeliver after restarts).
+    /// Stores a message with its images and bumps its conversation. Returns
+    /// `false` if the message was already known (history hand-overs repeat
+    /// messages received live).
     pub fn insert_message(&mut self, msg: &NewMessage, read: ReadState) -> anyhow::Result<bool> {
         let tx = self.conn.transaction()?;
         let conversation = msg.conversation.to_string();
@@ -155,6 +205,24 @@ impl Store {
             ],
         )? == 1;
         if inserted {
+            let message_id = tx.last_insert_rowid();
+            let mut stmt = tx.prepare(
+                "INSERT INTO attachments
+                     (message_id, idx, content_type, file_name, width, height, pointer)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for (idx, image) in (0i64..).zip(&msg.attachments) {
+                stmt.execute(params![
+                    message_id,
+                    idx,
+                    image.content_type,
+                    image.file_name,
+                    image.width,
+                    image.height,
+                    image.pointer,
+                ])?;
+            }
+            drop(stmt);
             let unread_delta = i64::from(read == ReadState::Unread);
             // Every message carries the conversation's current timer, so the
             // newest one also updates it. (All SET expressions see the old row.)
@@ -171,7 +239,7 @@ impl Store {
                 params![
                     conversation,
                     msg.timestamp.0,
-                    preview(&msg.body),
+                    preview(&text_with_images(&msg.body, msg.attachments.len())),
                     unread_delta,
                     msg.expires_in.map(duration_secs),
                 ],
@@ -223,10 +291,14 @@ impl Store {
             .map(Duration::from_secs))
     }
 
-    /// Deletes disappearing messages whose time is up. Returns the affected
-    /// conversations.
-    pub fn purge_expired(&mut self, now: Timestamp) -> anyhow::Result<Vec<ConversationId>> {
+    /// Deletes disappearing messages whose time is up.
+    pub fn purge_expired(&mut self, now: Timestamp) -> anyhow::Result<Purged> {
         let tx = self.conn.transaction()?;
+        let files = delete_attachments(
+            &tx,
+            "SELECT id FROM messages WHERE expires_at <= ?1",
+            params![now.0],
+        )?;
         let mut affected: Vec<String> = {
             let mut stmt =
                 tx.prepare("DELETE FROM messages WHERE expires_at <= ?1 RETURNING conversation")?;
@@ -241,7 +313,13 @@ impl Store {
             recompute_summary(&tx, conversation)?;
         }
         tx.commit()?;
-        affected.into_iter().map(|c| Ok(c.parse()?)).collect()
+        Ok(Purged {
+            conversations: affected
+                .into_iter()
+                .map(|c| c.parse())
+                .collect::<Result<_, _>>()?,
+            files,
+        })
     }
 
     /// Returns whether a matching message existed.
@@ -266,16 +344,22 @@ impl Store {
         Ok(found)
     }
 
-    /// Returns whether a matching message existed. The message is kept as a
-    /// "deleted" placeholder and no longer counts as unread.
+    /// The message is kept as a "deleted" placeholder and no longer counts
+    /// as unread; its images are dropped. Returns `None` if no message
+    /// matched, else the files of its downloaded images, to delete.
     pub fn delete_message(
         &mut self,
         conversation: &ConversationId,
         author: &Author,
         target: Timestamp,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Option<Vec<String>>> {
         let tx = self.conn.transaction()?;
         let id = conversation.to_string();
+        let files = delete_attachments(
+            &tx,
+            "SELECT id FROM messages WHERE conversation = ?1 AND author = ?2 AND ts = ?3",
+            params![id, author_column(author), target.0],
+        )?;
         let found = tx.execute(
             "UPDATE messages SET body = '', deleted = 1, is_read = 1
              WHERE conversation = ?1 AND author = ?2 AND ts = ?3",
@@ -285,7 +369,76 @@ impl Store {
             recompute_summary(&tx, &id)?;
         }
         tx.commit()?;
-        Ok(found)
+        Ok(found.then_some(files))
+    }
+
+    /// Images of the conversation's recent messages (those
+    /// [`Store::messages`] returns) that are yet to be downloaded.
+    pub fn missing_attachments(
+        &self,
+        conversation: &ConversationId,
+    ) -> anyhow::Result<Vec<MissingAttachment>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT a.id, a.content_type, a.pointer FROM attachments a
+             JOIN (SELECT id FROM messages WHERE conversation = ?1
+                   ORDER BY ts DESC LIMIT ?2) m ON a.message_id = m.id
+             WHERE a.file IS NULL
+             ORDER BY a.id",
+        )?;
+        let rows = stmt.query_map(params![conversation.to_string(), history_limit()], |row| {
+            Ok(MissingAttachment {
+                id: AttachmentId(row.get(0)?),
+                content_type: row.get(1)?,
+                pointer: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The images of a message, in order.
+    pub fn message_attachments(
+        &self,
+        conversation: &ConversationId,
+        author: &Author,
+        timestamp: Timestamp,
+    ) -> anyhow::Result<Vec<AttachmentId>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT a.id FROM attachments a JOIN messages m ON a.message_id = m.id
+             WHERE m.conversation = ?1 AND m.author = ?2 AND m.ts = ?3
+             ORDER BY a.idx",
+        )?;
+        let rows = stmt.query_map(
+            params![conversation.to_string(), author_column(author), timestamp.0],
+            |row| Ok(AttachmentId(row.get(0)?)),
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Records that an image was saved as `file`. Returns its conversation,
+    /// or `None` if the image is gone (its message was deleted meanwhile),
+    /// in which case the file should be deleted.
+    pub fn set_attachment_file(
+        &self,
+        id: AttachmentId,
+        file: &str,
+    ) -> anyhow::Result<Option<ConversationId>> {
+        let conversation: Option<String> = self
+            .conn
+            .query_row(
+                "UPDATE attachments SET file = ?2 WHERE id = ?1 RETURNING message_id",
+                params![id.0, file],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|message_id| {
+                self.conn.query_row(
+                    "SELECT conversation FROM messages WHERE id = ?1",
+                    params![message_id],
+                    |row| row.get(0),
+                )
+            })
+            .transpose()?;
+        Ok(conversation.map(|c| c.parse()).transpose()?)
     }
 
     /// Marks everything in a conversation as read and returns the messages a
@@ -409,15 +562,16 @@ impl Store {
 
     /// The most recent [`CHAT_HISTORY_LIMIT`] messages, oldest first.
     pub fn messages(&self, conversation: &ConversationId) -> anyhow::Result<Vec<StoredMessage>> {
+        let mut attachments = self.recent_attachments(conversation)?;
         let mut stmt = self.conn.prepare_cached(
-            "SELECT author, author_name, ts, body, status, edited, deleted FROM (
+            "SELECT author, author_name, ts, body, status, edited, deleted, id FROM (
                  SELECT * FROM messages WHERE conversation = ?1
                  ORDER BY ts DESC LIMIT ?2
              ) ORDER BY ts ASC",
         )?;
-        let limit = i64::try_from(CHAT_HISTORY_LIMIT).expect("history limit fits in i64");
-        let rows = stmt.query_map(params![conversation.to_string(), limit], |row| {
+        let rows = stmt.query_map(params![conversation.to_string(), history_limit()], |row| {
             let author: String = row.get(0)?;
+            let message_id: i64 = row.get(7)?;
             Ok(StoredMessage {
                 author: if author == AUTHOR_ME {
                     Author::Me
@@ -432,9 +586,42 @@ impl Store {
                     .and_then(DeliveryStatus::from_db),
                 edited: row.get(5)?,
                 deleted: row.get(6)?,
+                attachments: attachments.remove(&message_id).unwrap_or_default(),
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Images of the messages [`Store::messages`] returns, by message id.
+    fn recent_attachments(
+        &self,
+        conversation: &ConversationId,
+    ) -> anyhow::Result<HashMap<i64, Vec<StoredAttachment>>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT a.message_id, a.id, a.file_name, a.width, a.height, a.file
+             FROM attachments a
+             JOIN (SELECT id FROM messages WHERE conversation = ?1
+                   ORDER BY ts DESC LIMIT ?2) m ON a.message_id = m.id
+             ORDER BY a.message_id, a.idx",
+        )?;
+        let rows = stmt.query_map(params![conversation.to_string(), history_limit()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                StoredAttachment {
+                    id: AttachmentId(row.get(1)?),
+                    file_name: row.get(2)?,
+                    width: row.get(3)?,
+                    height: row.get(4)?,
+                    file: row.get(5)?,
+                },
+            ))
+        })?;
+        let mut attachments: HashMap<i64, Vec<StoredAttachment>> = HashMap::new();
+        for row in rows {
+            let (message_id, image) = row?;
+            attachments.entry(message_id).or_default().push(image);
+        }
+        Ok(attachments)
     }
 
     pub fn total_unread(&self) -> anyhow::Result<u32> {
@@ -466,15 +653,35 @@ fn author_column(author: &Author) -> &str {
     }
 }
 
+fn history_limit() -> i64 {
+    i64::try_from(CHAT_HISTORY_LIMIT).expect("history limit fits in i64")
+}
+
+/// Deletes the images of the messages `messages` selects (by id) and
+/// returns the files of those that were downloaded.
+fn delete_attachments(
+    conn: &Connection,
+    messages: &str,
+    params: impl rusqlite::Params,
+) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!(
+        "DELETE FROM attachments WHERE message_id IN ({messages}) RETURNING file"
+    ))?;
+    stmt.query_map(params, |row| row.get::<_, Option<String>>(0))?
+        .filter_map(Result::transpose)
+        .collect()
+}
+
 /// Re-derives a conversation's preview and unread count from its messages,
 /// after messages changed underneath them.
 fn recompute_summary(conn: &Connection, conversation: &str) -> rusqlite::Result<()> {
-    let latest: Option<String> = conn
+    let latest: Option<(String, i64)> = conn
         .query_row(
-            "SELECT body FROM messages WHERE conversation = ?1 AND deleted = 0
+            "SELECT body, (SELECT COUNT(*) FROM attachments WHERE message_id = messages.id)
+             FROM messages WHERE conversation = ?1 AND deleted = 0
              ORDER BY ts DESC LIMIT 1",
             params![conversation],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
     conn.execute(
@@ -482,7 +689,15 @@ fn recompute_summary(conn: &Connection, conversation: &str) -> rusqlite::Result<
              last_preview = ?2,
              unread = (SELECT COUNT(*) FROM messages WHERE conversation = ?1 AND is_read = 0)
          WHERE id = ?1",
-        params![conversation, latest.as_deref().map(preview)],
+        params![
+            conversation,
+            latest.map(|(body, images)| {
+                preview(&text_with_images(
+                    &body,
+                    usize::try_from(images).unwrap_or(0),
+                ))
+            })
+        ],
     )?;
     Ok(())
 }
@@ -514,6 +729,7 @@ fn fallback_name(id: &ConversationId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::NewAttachment;
 
     fn peer(s: &str) -> PeerId {
         PeerId(s.to_owned())
@@ -526,7 +742,18 @@ mod tests {
             author_name: Some(format!("{from}-profile")),
             timestamp: Timestamp(ts),
             body: body.to_owned(),
+            attachments: Vec::new(),
             expires_in: None,
+        }
+    }
+
+    fn image(n: u8) -> NewAttachment {
+        NewAttachment {
+            content_type: "image/jpeg".into(),
+            file_name: Some(format!("{n}.jpg")),
+            width: Some(640),
+            height: Some(480),
+            pointer: vec![n],
         }
     }
 
@@ -630,6 +857,7 @@ mod tests {
             author_name: None,
             timestamp: Timestamp(5),
             body: "yo".into(),
+            attachments: Vec::new(),
             expires_in: None,
         };
         store
@@ -700,10 +928,17 @@ mod tests {
             "edits update the preview"
         );
 
-        assert!(
+        assert_eq!(
             store
                 .delete_message(&alice, &author, Timestamp(1))
-                .expect("delete")
+                .expect("delete"),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            store
+                .delete_message(&alice, &Author::Me, Timestamp(1))
+                .expect("delete"),
+            None
         );
         assert!(store.messages(&alice).expect("messages")[0].deleted);
         let summary = store.conversation(&alice).expect("query").expect("exists");
@@ -736,14 +971,15 @@ mod tests {
             "timer is learned from incoming messages"
         );
 
-        assert!(
-            store
-                .purge_expired(Timestamp(11_999))
-                .expect("purge")
-                .is_empty()
+        assert_eq!(
+            store.purge_expired(Timestamp(11_999)).expect("purge"),
+            Purged::default()
         );
         assert_eq!(
-            store.purge_expired(Timestamp(12_000)).expect("purge"),
+            store
+                .purge_expired(Timestamp(12_000))
+                .expect("purge")
+                .conversations,
             vec![alice.clone()]
         );
 
@@ -763,6 +999,103 @@ mod tests {
 
         store.set_expiration_timer(&alice, None).expect("timer off");
         assert_eq!(store.expiration_timer(&alice).expect("timer"), None);
+    }
+
+    #[test]
+    fn images_are_stored_once_and_tracked_until_downloaded() {
+        let mut store = Store::open_in_memory().expect("in-memory db");
+        let alice = ConversationId::Direct(peer("alice"));
+        let msg = NewMessage {
+            attachments: vec![image(1), image(2)],
+            ..incoming(&alice, "alice", 10, "")
+        };
+        assert!(store.insert_message(&msg, ReadState::Read).expect("insert"));
+        assert!(!store.insert_message(&msg, ReadState::Read).expect("insert"));
+        assert_eq!(
+            store
+                .conversation(&alice)
+                .expect("query")
+                .expect("exists")
+                .last_preview
+                .as_deref(),
+            Some("🖼 2 photos")
+        );
+
+        let missing = store.missing_attachments(&alice).expect("missing");
+        let pointers: Vec<_> = missing.iter().map(|m| m.pointer.clone()).collect();
+        assert_eq!(
+            pointers,
+            vec![vec![1], vec![2]],
+            "duplicates are not stored"
+        );
+        let ids = store
+            .message_attachments(&alice, &Author::Peer(peer("alice")), Timestamp(10))
+            .expect("ids");
+        assert_eq!(ids, missing.iter().map(|m| m.id).collect::<Vec<_>>());
+
+        assert_eq!(
+            store
+                .set_attachment_file(ids[0], "a.jpg")
+                .expect("set file"),
+            Some(alice.clone())
+        );
+        assert_eq!(store.missing_attachments(&alice).expect("missing").len(), 1);
+        let images = &store.messages(&alice).expect("messages")[0].attachments;
+        let files: Vec<_> = images.iter().map(|i| i.file.as_deref()).collect();
+        assert_eq!(files, vec![Some("a.jpg"), None]);
+        assert_eq!(images[0].file_name.as_deref(), Some("1.jpg"));
+        assert_eq!((images[0].width, images[0].height), (Some(640), Some(480)));
+
+        // Deleting the message drops its images and hands back the files.
+        assert_eq!(
+            store
+                .delete_message(&alice, &Author::Peer(peer("alice")), Timestamp(10))
+                .expect("delete"),
+            Some(vec!["a.jpg".to_owned()])
+        );
+        assert!(
+            store
+                .missing_attachments(&alice)
+                .expect("missing")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .set_attachment_file(ids[1], "b.jpg")
+                .expect("set file"),
+            None,
+            "a late download of a deleted image is reported"
+        );
+    }
+
+    #[test]
+    fn purging_returns_image_files() {
+        let mut store = Store::open_in_memory().expect("in-memory db");
+        let alice = ConversationId::Direct(peer("alice"));
+        let msg = NewMessage {
+            attachments: vec![image(1)],
+            expires_in: Some(Duration::from_secs(1)),
+            ..incoming(&alice, "alice", 0, "see this")
+        };
+        store.insert_message(&msg, ReadState::Read).expect("insert");
+        assert_eq!(
+            store
+                .conversation(&alice)
+                .expect("query")
+                .expect("exists")
+                .last_preview
+                .as_deref(),
+            Some("🖼 see this")
+        );
+        let id = store.missing_attachments(&alice).expect("missing")[0].id;
+        store.set_attachment_file(id, "1.jpg").expect("set file");
+        assert_eq!(
+            store.purge_expired(Timestamp(1_000)).expect("purge"),
+            Purged {
+                conversations: vec![alice],
+                files: vec!["1.jpg".to_owned()],
+            }
+        );
     }
 
     #[test]

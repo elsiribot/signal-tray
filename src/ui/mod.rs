@@ -3,20 +3,23 @@
 //! the controller gives it and reports user intent as [`UiEvent`]s.
 
 mod format;
+mod images;
 mod placement;
 pub mod settings;
 
 use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use gtk::prelude::*;
-use gtk::{gdk, glib, pango};
+use gtk::{gdk, gio, glib, pango};
 use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell as _};
 
 use crate::config::{Color, Config, Opacity};
 use crate::model::{AccountId, ChatRef, DeliveryStatus, Timestamp};
 use crate::store::ConversationSummary;
+use images::Thumbnails;
+pub use images::{ImageState, ImageView, StagedImage};
 pub use placement::Placement;
 
 const CSS: &str = include_str!("style.css");
@@ -39,9 +42,11 @@ pub enum UiEvent {
     /// The open conversation is on screen and focused, so its messages
     /// count as read.
     Seen(ChatRef),
+    /// Text, images or both.
     Send {
         chat: ChatRef,
         text: String,
+        images: Vec<StagedImage>,
     },
     /// The window was brought up.
     Shown,
@@ -108,6 +113,7 @@ pub struct MessageView {
     /// Shown above incoming group messages.
     pub sender: Option<String>,
     pub body: String,
+    pub images: Vec<ImageView>,
     pub timestamp: Timestamp,
     pub edited: bool,
     pub deleted: bool,
@@ -171,9 +177,12 @@ struct State {
     restore_scroll: Option<f64>,
     /// Search text the chat list was last built for.
     listed_filter: String,
+    /// Images to send with the next message of the open chat.
+    staged: Vec<StagedImage>,
 }
 
 pub struct Ui {
+    weak_self: Weak<Self>,
     window: gtk::ApplicationWindow,
     /// Holds the one rule that depends on the configured opacity.
     opacity_css: gtk::CssProvider,
@@ -181,6 +190,8 @@ pub struct Ui {
     account_css: gtk::CssProvider,
     uses_layer_shell: bool,
     hide_on_focus_loss: Cell<bool>,
+    /// The file chooser is up; losing focus to it doesn't hide the window.
+    choosing_files: Cell<bool>,
     stack: gtk::Stack,
     banner: gtk::Label,
     banner_revealer: gtk::Revealer,
@@ -198,7 +209,10 @@ pub struct Ui {
     chat_account: gtk::Label,
     messages: gtk::ListBox,
     messages_scroll: gtk::ScrolledWindow,
+    thumbnails: Rc<Thumbnails>,
+    staged_box: gtk::Box,
     compose: gtk::TextView,
+    compose_placeholder: gtk::Label,
     events: async_channel::Sender<UiEvent>,
     state: RefCell<State>,
     /// Bumped per banner so only the latest one's timeout hides it.
@@ -373,9 +387,16 @@ impl Ui {
             move |buffer| compose_placeholder.set_visible(buffer.char_count() == 0)
         ));
 
+        let staged_box = gtk::Box::builder()
+            .spacing(4)
+            .visible(false)
+            .css_classes(["staged"])
+            .build();
+
         let chat_page = vbox(0);
         chat_page.append(&header);
         chat_page.append(&messages_scroll);
+        chat_page.append(&staged_box);
         chat_page.append(&compose_overlay);
 
         let stack = gtk::Stack::builder()
@@ -394,12 +415,14 @@ impl Ui {
         root.append(&stack);
         window.set_child(Some(&root));
 
-        let ui = Rc::new(Self {
+        let ui = Rc::new_cyclic(|weak_self| Self {
+            weak_self: weak_self.clone(),
             window,
             opacity_css,
             account_css,
             uses_layer_shell,
             hide_on_focus_loss: Cell::new(config.hide_on_focus_loss),
+            choosing_files: Cell::default(),
             stack,
             banner,
             banner_revealer,
@@ -417,18 +440,21 @@ impl Ui {
             chat_account,
             messages,
             messages_scroll,
+            thumbnails: Rc::default(),
+            staged_box,
             compose,
+            compose_placeholder,
             events,
             state: RefCell::default(),
             banner_generation: Rc::default(),
         });
-        ui.connect_signals(&back);
+        ui.connect_signals(&back, &chat_page);
         ui.set_opacity(config.opacity);
         ui.show_status(Status::Busy, "Starting…");
         ui
     }
 
-    fn connect_signals(self: &Rc<Self>, back: &gtk::Button) {
+    fn connect_signals(self: &Rc<Self>, back: &gtk::Button, chat_page: &gtk::Box) {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         keys.connect_key_pressed(glib::clone!(
@@ -484,6 +510,29 @@ impl Ui {
             move |_| ui.show_list()
         ));
 
+        // Captured, so files dropped on the compose box aren't inserted as
+        // text.
+        let drop = gtk::DropTarget::new(glib::Type::INVALID, gdk::DragAction::COPY);
+        drop.set_types(&[gdk::FileList::static_type(), gdk::Texture::static_type()]);
+        drop.set_propagation_phase(gtk::PropagationPhase::Capture);
+        drop.connect_drop(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            #[upgrade_or]
+            false,
+            move |_, value, _, _| {
+                if let Ok(files) = value.get::<gdk::FileList>() {
+                    ui.stage_files(files.files());
+                } else if let Ok(texture) = value.get::<gdk::Texture>() {
+                    ui.stage_texture(texture);
+                } else {
+                    return false;
+                }
+                true
+            }
+        ));
+        chat_page.add_controller(drop);
+
         let adjustment = self.messages_scroll.vadjustment();
         adjustment.connect_upper_notify(glib::clone!(
             #[weak(rename_to = ui)]
@@ -497,6 +546,16 @@ impl Ui {
                     adj.set_value(adj.upper() - adj.page_size());
                 } else if let Some(value) = restore {
                     adj.set_value(value);
+                }
+            }
+        ));
+        // E.g. when images are staged below it.
+        adjustment.connect_page_size_notify(glib::clone!(
+            #[weak(rename_to = ui)]
+            self,
+            move |adj| {
+                if ui.state.borrow().stick_to_bottom {
+                    adj.set_value(adj.upper() - adj.page_size());
                 }
             }
         ));
@@ -579,11 +638,12 @@ impl Ui {
                 self,
                 move || {
                     let main: &gtk::Window = ui.window.upcast_ref();
-                    let in_app = ui.window.application().is_some_and(|app| {
-                        app.windows()
-                            .iter()
-                            .any(|w| w.is_active() || (w != main && w.is_visible()))
-                    });
+                    let in_app = ui.choosing_files.get()
+                        || ui.window.application().is_some_and(|app| {
+                            app.windows()
+                                .iter()
+                                .any(|w| w.is_active() || (w != main && w.is_visible()))
+                        });
                     if ui.hide_on_focus_loss.get() && ui.window.is_visible() && !in_app {
                         ui.hide();
                     }
@@ -931,6 +991,9 @@ impl Ui {
         let switching = self.state.borrow().current.as_ref() != Some(id);
         if switching {
             self.compose.buffer().set_text("");
+            self.state.borrow_mut().staged.clear();
+            self.render_staged();
+            self.thumbnails.clear();
         }
         self.state.borrow_mut().current = Some(id.clone());
         self.update_chat_title(id);
@@ -980,29 +1043,50 @@ impl Ui {
                 last_day = day;
                 self.messages.append(&day_separator(message.timestamp));
             }
-            self.messages.append(&message_row(message, &account));
+            self.messages
+                .append(&message_row(message, &account, &self.thumbnails));
         }
     }
 
-    fn append_pending(&self, account: &AccountId, text: &str) {
+    fn append_pending(&self, account: &AccountId, text: &str, images: &[StagedImage]) {
         self.state.borrow_mut().stick_to_bottom = true;
         let view = MessageView {
             status: MessageStatus::Pending,
             sender: None,
             body: text.to_owned(),
+            images: images
+                .iter()
+                .map(|staged| ImageView {
+                    state: ImageState::Sending(staged.thumbnail.clone()),
+                    file_name: staged.image.file_name.clone(),
+                    width: staged.image.width,
+                    height: staged.image.height,
+                })
+                .collect(),
             timestamp: Timestamp(glib::real_time() / 1000),
             edited: false,
             deleted: false,
         };
-        self.messages.append(&message_row(&view, account));
+        self.messages
+            .append(&message_row(&view, account, &self.thumbnails));
     }
 
-    /// Puts the text of a failed send back into the compose box.
-    pub fn restore_draft(&self, id: &ChatRef, text: &str) {
+    /// Puts the text and images of a failed send back into the compose box.
+    pub fn restore_draft(&self, id: &ChatRef, text: &str, images: Vec<StagedImage>) {
+        if self.state.borrow().current.as_ref() != Some(id) {
+            return;
+        }
         let buffer = self.compose.buffer();
-        if self.state.borrow().current.as_ref() == Some(id) && buffer.char_count() == 0 {
+        if buffer.char_count() == 0 {
             buffer.set_text(text);
         }
+        {
+            let mut state = self.state.borrow_mut();
+            if state.staged.is_empty() {
+                state.staged = images;
+            }
+        }
+        self.render_staged();
     }
 
     fn send_compose(&self) {
@@ -1012,15 +1096,204 @@ impl Ui {
         let buffer = self.compose.buffer();
         let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
         let text = text.trim();
-        if text.is_empty() {
+        let images = std::mem::take(&mut self.state.borrow_mut().staged);
+        if text.is_empty() && images.is_empty() {
             return;
         }
-        self.append_pending(&chat.account, text);
+        self.append_pending(&chat.account, text, &images);
         self.emit(UiEvent::Send {
             chat,
             text: text.to_owned(),
+            images,
         });
         buffer.set_text("");
+        self.render_staged();
+    }
+
+    // ---- images to send ----------------------------------------------------
+
+    fn render_staged(&self) {
+        while let Some(child) = self.staged_box.first_child() {
+            self.staged_box.remove(&child);
+        }
+        let staged = self.state.borrow().staged.clone();
+        for (index, image) in staged.iter().enumerate() {
+            self.staged_box.append(&self.staged_preview(index, image));
+        }
+        self.staged_box.set_visible(!staged.is_empty());
+        self.compose_placeholder.set_label(if staged.is_empty() {
+            "Message"
+        } else {
+            "Add a caption"
+        });
+    }
+
+    fn staged_preview(&self, index: usize, image: &StagedImage) -> gtk::Overlay {
+        let size = images::STAGED_SIZE;
+        let preview: gtk::Widget = match &image.thumbnail {
+            Some(texture) => images::picture(texture, size, size),
+            None => {
+                let icon = gtk::Label::new(Some("🖼"));
+                icon.set_size_request(size, size);
+                icon.upcast()
+            }
+        };
+        preview.add_css_class("preview-image");
+        if let Some(name) = &image.image.file_name {
+            preview.set_tooltip_text(Some(name));
+        }
+        let remove = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Remove (Backspace)")
+            .focusable(false)
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Start)
+            .css_classes(["unstage"])
+            .build();
+        let weak = self.weak_self.clone();
+        remove.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.unstage(index);
+            }
+        });
+        let overlay = gtk::Overlay::builder().child(&preview).build();
+        overlay.add_overlay(&remove);
+        overlay
+    }
+
+    fn unstage(&self, index: usize) {
+        {
+            let mut state = self.state.borrow_mut();
+            if index >= state.staged.len() {
+                return;
+            }
+            state.staged.remove(index);
+        }
+        self.render_staged();
+    }
+
+    /// Stages an image once read, unless the user moved to another chat
+    /// meanwhile.
+    fn stage_when_read(
+        &self,
+        reading: impl std::future::Future<Output = Result<StagedImage, String>> + 'static,
+    ) {
+        let Some(chat) = self.current_chat() else {
+            return;
+        };
+        let weak = self.weak_self.clone();
+        glib::spawn_future_local(async move {
+            let result = reading.await;
+            let Some(ui) = weak.upgrade() else { return };
+            match result {
+                Ok(image) if ui.current_chat().as_ref() == Some(&chat) => {
+                    ui.state.borrow_mut().staged.push(image);
+                    ui.render_staged();
+                }
+                Ok(_) => {}
+                Err(err) => ui.show_error(&err),
+            }
+        });
+    }
+
+    fn stage_files(&self, files: Vec<gio::File>) {
+        for file in files {
+            self.stage_when_read(images::read_file(file));
+        }
+    }
+
+    fn stage_texture(&self, texture: gdk::Texture) {
+        self.stage_when_read(images::read_texture(texture));
+    }
+
+    fn choose_images(&self) {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Images"));
+        filter.add_mime_type("image/*");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let dialog = gtk::FileDialog::builder()
+            .title("Send images")
+            .modal(true)
+            .filters(&filters)
+            .default_filter(&filter)
+            .build();
+        self.choosing_files.set(true);
+        if self.uses_layer_shell {
+            // Out of the chooser's way.
+            self.window.set_layer(Layer::Bottom);
+        }
+        let weak = self.weak_self.clone();
+        let window = self.window.clone();
+        glib::spawn_future_local(async move {
+            let chosen = dialog
+                .open_multiple_future(images::dialog_parent(window.upcast_ref()))
+                .await;
+            let Some(ui) = weak.upgrade() else { return };
+            ui.choosing_files.set(false);
+            if ui.uses_layer_shell {
+                ui.window.set_layer(Layer::Top);
+            }
+            // Layer surfaces don't get focus back on their own.
+            ui.show();
+            match chosen {
+                Ok(files) => {
+                    ui.stage_files(files.iter::<gio::File>().filter_map(Result::ok).collect())
+                }
+                Err(err) if err.matches(gtk::DialogError::Dismissed) => {}
+                Err(err) => {
+                    tracing::warn!(%err, "choosing images failed");
+                    ui.show_error("Couldn't open the file chooser.");
+                }
+            }
+        });
+    }
+
+    /// Stages copied images or image files. Returns false for anything
+    /// else, which is pasted as text.
+    fn paste_images(&self) -> bool {
+        let clipboard = self.compose.clipboard();
+        let formats = clipboard.formats().union_deserialize_types();
+        let has_text = formats.contains_type(glib::Type::STRING);
+        if formats.contains_type(gdk::FileList::static_type()) {
+            let weak = self.weak_self.clone();
+            glib::spawn_future_local(async move {
+                let files = clipboard
+                    .read_value_future(gdk::FileList::static_type(), glib::Priority::DEFAULT)
+                    .await
+                    .ok()
+                    .and_then(|value| value.get::<gdk::FileList>().ok())
+                    .map(|list| list.files())
+                    .unwrap_or_default();
+                let Some(ui) = weak.upgrade() else { return };
+                // Links are file lists too, but not files to send.
+                if !files.is_empty() && files.iter().all(|f| f.path().is_some()) {
+                    ui.stage_files(files);
+                } else if let Ok(Some(text)) = clipboard.read_text_future().await {
+                    let buffer = ui.compose.buffer();
+                    buffer.delete_selection(true, true);
+                    buffer.insert_interactive_at_cursor(&text, true);
+                }
+            });
+            return true;
+        }
+        if has_text || !formats.contains_type(gdk::Texture::static_type()) {
+            return false;
+        }
+        let weak = self.weak_self.clone();
+        glib::spawn_future_local(async move {
+            let texture = clipboard.read_texture_future().await;
+            let Some(ui) = weak.upgrade() else { return };
+            match texture {
+                Ok(Some(texture)) => ui.stage_texture(texture),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(%err, "reading the clipboard failed");
+                    ui.show_error("Couldn't paste the image.");
+                }
+            }
+        });
+        true
     }
 
     fn scroll_messages(&self, pages: f64) {
@@ -1113,6 +1386,16 @@ impl Ui {
     fn on_chat_key(&self, key: gdk::Key, plain: bool, ctrl: bool, alt: bool) -> bool {
         match key {
             gdk::Key::Return | gdk::Key::KP_Enter if plain => self.send_compose(),
+            gdk::Key::v if ctrl => return self.paste_images(),
+            gdk::Key::o if ctrl => self.choose_images(),
+            gdk::Key::BackSpace
+                if plain
+                    && self.compose.buffer().char_count() == 0
+                    && !self.state.borrow().staged.is_empty() =>
+            {
+                let last = self.state.borrow().staged.len() - 1;
+                self.unstage(last);
+            }
             gdk::Key::Page_Up if plain => self.scroll_messages(-1.0),
             gdk::Key::Page_Down if plain => self.scroll_messages(1.0),
             gdk::Key::Up if alt => self.open_neighbour(-1),
@@ -1283,7 +1566,11 @@ fn day_separator(ts: Timestamp) -> gtk::ListBoxRow {
         .build()
 }
 
-fn message_row(message: &MessageView, account: &AccountId) -> gtk::ListBoxRow {
+fn message_row(
+    message: &MessageView,
+    account: &AccountId,
+    thumbnails: &Rc<Thumbnails>,
+) -> gtk::ListBoxRow {
     let outgoing = !matches!(message.status, MessageStatus::Incoming);
     let bubble = vbox(0);
     bubble.add_css_class("bubble");
@@ -1299,15 +1586,20 @@ fn message_row(message: &MessageView, account: &AccountId) -> gtk::ListBoxRow {
         bubble.append(&label(sender, &["sender"]));
     }
 
-    let body = if message.deleted {
-        label("This message was deleted", &["body", "deleted"])
+    if message.deleted {
+        bubble.append(&label("This message was deleted", &["body", "deleted"]));
     } else {
-        label(&message.body, &["body"])
-    };
-    body.set_wrap(true);
-    body.set_wrap_mode(pango::WrapMode::WordChar);
-    body.set_max_width_chars(34);
-    bubble.append(&body);
+        for image in &message.images {
+            bubble.append(&thumbnails.widget(image));
+        }
+        if !message.body.is_empty() || message.images.is_empty() {
+            let body = label(&message.body, &["body"]);
+            body.set_wrap(true);
+            body.set_wrap_mode(pango::WrapMode::WordChar);
+            body.set_max_width_chars(34);
+            bubble.append(&body);
+        }
+    }
 
     let mut meta = format::message_time(message.timestamp);
     if message.edited {
@@ -1354,6 +1646,9 @@ fn help_page() -> gtk::ScrolledWindow {
         ("Chat", ""),
         ("Enter", "send"),
         ("Shift+Enter", "new line"),
+        ("Ctrl+V", "paste image"),
+        ("Ctrl+O", "send images"),
+        ("Backspace", "remove last image"),
         ("Alt+↑ ↓", "previous / next chat"),
         ("PgUp PgDn", "scroll history"),
         ("Ctrl+.", "emoji"),

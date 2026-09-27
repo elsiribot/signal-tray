@@ -12,6 +12,8 @@ touching the mouse.
 - Tray icon (StatusNotifierItem) with an unread badge. Left click toggles.
 - Desktop notifications when a message arrives and you're not looking.
   Clicking one opens that chat.
+- Images: received ones are shown inline (click to open in your image
+  viewer); send them by pasting, dropping or picking files.
 - Read receipts, delivery ticks (✓ sent, ✓✓ delivered, bold ✓✓ read), edits,
   remote deletes, and sync with messages you send from your phone.
 - Several accounts side by side, their chats in one list. Each account has
@@ -49,8 +51,8 @@ On first start the window shows a QR code. On your phone go to
 **Signal → Settings → Linked devices → Link new device** and scan it.
 Your phone then asks whether to **transfer message history**. If you accept,
 it uploads an encrypted archive that signal-tray downloads and imports (your
-chats, and pointers to media from the last 45 days; attachments aren't shown
-yet). If you quit during the import, it resumes on the next start. If you
+chats, and pointers to media from the last 45 days, whose images are
+downloaded when you open their chat). If you quit during the import, it resumes on the next start. If you
 skip it, chats start from the moment of linking.
 Until the first message arrives, the list shows all contacts and groups
 alphabetically; after that it shows chats only, and contacts are found by
@@ -114,6 +116,9 @@ swaybar's `tray` or waybar's `tray` module.
 |           | `PgUp` `PgDn`                    | scroll history                      |
 |           | `Alt+←`                          | back to the list                    |
 |           | `Ctrl+.`                         | emoji picker                        |
+|           | `Ctrl+V`                         | paste text, or an image to send     |
+|           | `Ctrl+O`                         | pick images to send                 |
+|           | `Backspace` (empty message)      | remove the last image to send       |
 
 Search matches every contact and group, so it's also how you start a new
 conversation.
@@ -159,13 +164,15 @@ with:
   store). presage also writes each message there as it arrives; those
   copies are moved into `messages.sqlite` and deleted on the next start, so
   there's one long-lived copy of each message.
+- `attachments/`: received and sent images. An image is deleted along with
+  its message (remote deletes, disappearing messages).
 
 Versions before multi-account support kept both files directly in
 `~/.local/share/signal-tray/`; they're moved into `accounts/1/` on the first
 start. An account directory that isn't listed in the config is left over
 from linking that never finished, and is deleted on start.
 
-Neither file is encrypted yet; the directory is only accessible to your
+None of these are encrypted yet; the directory is only accessible to your
 user (mode 0700).
 
 Logs go to stderr. Use `RUST_LOG=signal_tray=debug` for RPC-level detail.
@@ -173,9 +180,9 @@ Message contents are not logged.
 
 ## Not in v1
 
-Sending or opening attachments (received ones show as `📎 name`),
-reactions, typing indicators, voice/video, stickers (shown as `[sticker]`),
-changing a chat's disappearing-message timer.
+Attachments other than images (received ones show as `📎 name`), view-once
+media, reactions, typing indicators, voice/video, stickers (shown as
+`[sticker]`), changing a chat's disappearing-message timer.
 
 ## Development
 

@@ -1,10 +1,15 @@
 //! Sample conversations for `--demo`, to try the UI without a Signal
 //! account: a personal and a work account.
 
-use gtk::glib;
+use std::path::{Path, PathBuf};
+
+use gtk::prelude::*;
+use gtk::{gdk, glib};
 
 use crate::config::{AccountConfig, Color};
-use crate::model::{AccountId, Author, ConversationId, NewMessage, PeerId, Timestamp};
+use crate::model::{
+    AccountId, Author, ConversationId, NewAttachment, NewMessage, PeerId, Timestamp,
+};
 use crate::store::{ReadState, Store};
 
 const MINUTE: i64 = 60_000;
@@ -13,20 +18,29 @@ const DAY: i64 = 24 * HOUR;
 
 type Sample<'a> = (&'a ConversationId, Option<&'a str>, i64, &'a str, ReadState);
 
-/// The demo accounts with their in-memory stores.
-pub fn accounts() -> anyhow::Result<Vec<(AccountConfig, Store)>> {
+/// The demo accounts with their in-memory stores and image directories,
+/// which are temporary.
+pub fn accounts() -> anyhow::Result<Vec<(AccountConfig, Store, PathBuf)>> {
     let account = |id: &str, name: &str, color: Color| AccountConfig {
         id: AccountId::try_from(id.to_owned()).expect("valid account id"),
         name: name.to_owned(),
         color,
     };
+    let dir = glib::tmp_dir().join(format!("signal-tray-demo-{}", std::process::id()));
+    let (personal_dir, work_dir) = (dir.join("1"), dir.join("2"));
+    std::fs::create_dir_all(&personal_dir)?;
+    std::fs::create_dir_all(&work_dir)?;
     let mut personal = Store::open_in_memory()?;
-    populate_personal(&mut personal)?;
+    populate_personal(&mut personal, &personal_dir)?;
     let mut work = Store::open_in_memory()?;
     populate_work(&mut work)?;
     Ok(vec![
-        (account("1", "Personal", Color::PALETTE[0]), personal),
-        (account("2", "Work", Color::PALETTE[1]), work),
+        (
+            account("1", "Personal", Color::PALETTE[0]),
+            personal,
+            personal_dir,
+        ),
+        (account("2", "Work", Color::PALETTE[1]), work, work_dir),
     ])
 }
 
@@ -81,7 +95,7 @@ fn populate_work(store: &mut Store) -> anyhow::Result<()> {
     )
 }
 
-fn populate_personal(store: &mut Store) -> anyhow::Result<()> {
+fn populate_personal(store: &mut Store, images: &Path) -> anyhow::Result<()> {
     let alice = direct("alice");
     let bob = direct("bob");
     let family = ConversationId::Group("family".into());
@@ -97,13 +111,6 @@ fn populate_personal(store: &mut Store) -> anyhow::Result<()> {
     ])?;
 
     let messages: &[Sample<'_>] = &[
-        (
-            &carol,
-            Some("carol"),
-            26 * HOUR,
-            "📎 IMG_2041.jpg",
-            ReadState::Read,
-        ),
         (
             &carol,
             Some("carol"),
@@ -183,7 +190,67 @@ fn populate_personal(store: &mut Store) -> anyhow::Result<()> {
             ReadState::Unread,
         ),
     ];
-    insert(store, messages)
+    insert(store, messages)?;
+    insert_photo(store, &carol, "carol", 26 * HOUR, images)
+}
+
+/// A generated "photo" from `from`, already downloaded.
+fn insert_photo(
+    store: &mut Store,
+    conversation: &ConversationId,
+    from: &str,
+    age: i64,
+    dir: &Path,
+) -> anyhow::Result<()> {
+    const WIDTH: usize = 320;
+    const HEIGHT: usize = 240;
+    let timestamp = Timestamp(glib::real_time() / 1000 - age);
+    let author = Author::Peer(peer(from));
+    store.insert_message(
+        &NewMessage {
+            conversation: conversation.clone(),
+            author: author.clone(),
+            author_name: Some(capitalize(from)),
+            timestamp,
+            body: String::new(),
+            attachments: vec![NewAttachment {
+                content_type: "image/png".into(),
+                file_name: Some("IMG_2041.png".into()),
+                width: Some(WIDTH as u32),
+                height: Some(HEIGHT as u32),
+                pointer: Vec::new(),
+            }],
+            expires_in: None,
+        },
+        ReadState::Read,
+    )?;
+    // A dusky sky over a dark hill.
+    let mut pixels = Vec::with_capacity(WIDTH * HEIGHT * 3);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let hill = HEIGHT * 2 / 3 + (x * (WIDTH - x)) / (WIDTH * 4);
+            let rgb = if y > HEIGHT - hill / 2 {
+                [30, 50, 40]
+            } else {
+                let t = y * 255 / HEIGHT;
+                [(90 + t / 2) as u8, (60 + t / 3) as u8, (160 - t / 3) as u8]
+            };
+            pixels.extend_from_slice(&rgb);
+        }
+    }
+    let texture = gdk::MemoryTexture::new(
+        WIDTH as i32,
+        HEIGHT as i32,
+        gdk::MemoryFormat::R8g8b8,
+        &glib::Bytes::from_owned(pixels),
+        WIDTH * 3,
+    );
+    for id in store.message_attachments(conversation, &author, timestamp)? {
+        let file = format!("{}.png", id.0);
+        texture.save_to_png(dir.join(&file))?;
+        store.set_attachment_file(id, &file)?;
+    }
+    Ok(())
 }
 
 fn insert(store: &mut Store, messages: &[Sample<'_>]) -> anyhow::Result<()> {
@@ -203,6 +270,7 @@ fn insert(store: &mut Store, messages: &[Sample<'_>]) -> anyhow::Result<()> {
                 author,
                 timestamp: Timestamp(now - age),
                 body: (*body).to_owned(),
+                attachments: Vec::new(),
                 expires_in: None,
             },
             *read,

@@ -17,14 +17,16 @@ use gtk::{gio, glib};
 use crate::accounts;
 use crate::config::{self, AccountConfig, Config};
 use crate::model::{
-    self, AccountId, Author, ChatRef, ConversationId, NewMessage, PeerId, SignalEvent, Timestamp,
+    self, AccountId, Author, ChatRef, ConversationId, NewAttachment, NewMessage, PeerId,
+    SignalEvent, Timestamp,
 };
 use crate::signal::{self, Backend, Connection, Event, HistoryStatus, Origin, SendError};
-use crate::store::{ConversationSummary, ReadState, Store};
+use crate::store::{AttachmentId, ConversationSummary, MissingAttachment, ReadState, Store};
 use crate::tray::{self, TrayAction, TrayHandle};
 use crate::ui::settings::{Setting, Settings};
 use crate::ui::{
-    AccountView, LinkState, ListedChat, MessageStatus, MessageView, Status, Ui, UiEvent,
+    AccountView, ImageState, ImageView, LinkState, ListedChat, MessageStatus, MessageView,
+    StagedImage, Status, Ui, UiEvent,
 };
 
 /// How often disappearing messages are checked for expiry.
@@ -43,6 +45,12 @@ pub enum Mode {
 struct Account {
     id: AccountId,
     store: RefCell<Store>,
+    /// Where images are saved.
+    attachments: PathBuf,
+    /// Images being downloaded.
+    downloading: RefCell<HashSet<AttachmentId>>,
+    /// Images whose download failed; retried when their chat is opened.
+    failed: RefCell<HashSet<AttachmentId>>,
     /// `None` in demo mode. Taken when the account is removed, which stops
     /// the backend and ends its event loop.
     backend: RefCell<Option<Backend>>,
@@ -56,10 +64,18 @@ struct Account {
 }
 
 impl Account {
-    fn new(id: AccountId, store: Store, backend: Option<Backend>) -> Rc<Self> {
+    fn new(
+        id: AccountId,
+        store: Store,
+        attachments: PathBuf,
+        backend: Option<Backend>,
+    ) -> Rc<Self> {
         Rc::new(Self {
             id,
             store: RefCell::new(store),
+            attachments,
+            downloading: RefCell::default(),
+            failed: RefCell::default(),
             backend: RefCell::new(backend),
             number: RefCell::default(),
             ready: Cell::default(),
@@ -74,6 +90,23 @@ impl Account {
             conversation,
         }
     }
+
+    /// Deletes images whose messages are gone.
+    fn remove_files(&self, files: Vec<String>) {
+        for file in files {
+            let path = self.attachments.join(file);
+            if let Err(err) = std::fs::remove_file(&path)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(%err, path = %path.display(), "deleting an image failed");
+            }
+        }
+    }
+}
+
+/// Name of an image in the attachments directory.
+fn attachment_file(id: AttachmentId, content_type: &str) -> String {
+    format!("{}.{}", id.0, model::file_extension(content_type))
 }
 
 /// Opens an account's store and starts its backend.
@@ -83,7 +116,7 @@ fn open_account(
     device_name: &str,
 ) -> anyhow::Result<(Rc<Account>, async_channel::Receiver<Event>)> {
     let paths = accounts::paths(data_dir, id);
-    std::fs::create_dir_all(&paths.dir)?;
+    std::fs::create_dir_all(&paths.attachments)?;
     let store = Store::open(&paths.messages)?;
     let (backend, events) = Backend::spawn(signal::SpawnOptions {
         label: id.to_string(),
@@ -91,7 +124,10 @@ fn open_account(
         history_marker: paths.history_marker,
         device_name: device_name.to_owned(),
     })?;
-    Ok((Account::new(id.clone(), store, Some(backend)), events))
+    Ok((
+        Account::new(id.clone(), store, paths.attachments, Some(backend)),
+        events,
+    ))
 }
 
 pub struct Controller {
@@ -155,8 +191,8 @@ impl Controller {
             }
             Mode::Demo => {
                 config.accounts.clear();
-                for (account_config, store) in crate::demo::accounts()? {
-                    let account = Account::new(account_config.id.clone(), store, None);
+                for (account_config, store, attachments) in crate::demo::accounts()? {
+                    let account = Account::new(account_config.id.clone(), store, attachments, None);
                     account.ready.set(true);
                     opened.insert(account_config.id.clone(), account);
                     config.accounts.push(account_config);
@@ -497,8 +533,8 @@ impl Controller {
             match event {
                 UiEvent::Open(chat) => self.open(&chat),
                 UiEvent::Seen(chat) => self.mark_seen(&chat),
-                UiEvent::Send { chat, text } => {
-                    glib::spawn_future_local(self.clone().send(chat, text));
+                UiEvent::Send { chat, text, images } => {
+                    glib::spawn_future_local(self.clone().send(chat, text, images));
                 }
                 UiEvent::Shown => {}
                 UiEvent::RetryLink => {
@@ -553,8 +589,9 @@ impl Controller {
             for account in accounts {
                 let purged = account.store.borrow_mut().purge_expired(now);
                 match purged {
-                    Ok(conversations) => {
-                        for conversation in conversations {
+                    Ok(purged) => {
+                        account.remove_files(purged.files);
+                        for conversation in purged.conversations {
                             self.withdraw(&account, &conversation);
                             self.touch(&account.chat(conversation));
                         }
@@ -717,6 +754,7 @@ impl Controller {
             tracing::warn!(%chat, "opening a chat of an unknown account");
             return;
         };
+        self.fetch_missing_attachments(&account, &chat.conversation, true);
         match self.message_views(&account, &chat.conversation) {
             Ok(views) => self.ui.show_chat(chat, &views),
             Err(err) => {
@@ -769,31 +807,30 @@ impl Controller {
         }
     }
 
-    async fn send(self: Rc<Self>, chat: ChatRef, text: String) {
+    async fn send(self: Rc<Self>, chat: ChatRef, text: String, images: Vec<StagedImage>) {
         let timestamp = Timestamp(glib::real_time() / 1000);
-        let result: Result<(), SendError> = match self.account(&chat.account) {
+        let result: Result<Vec<Vec<u8>>, SendError> = match self.account(&chat.account) {
             Some(account) => {
-                let sending = account
-                    .backend
-                    .borrow()
-                    .as_ref()
-                    .map(|b| b.send_text(&chat.conversation, &text, timestamp));
+                let sending = account.backend.borrow().as_ref().map(|b| {
+                    let uploads = images.iter().map(|i| i.image.clone()).collect();
+                    b.send(&chat.conversation, &text, uploads, timestamp)
+                });
                 match sending {
                     Some(sending) => sending.await,
-                    // Demo mode.
-                    None => Ok(()),
+                    // Demo mode: nothing to download from.
+                    None => Ok(vec![Vec::new(); images.len()]),
                 }
             }
             None => Err(SendError::Offline),
         };
         // The account may have been removed while sending.
-        let account = match (result, self.account(&chat.account)) {
-            (Ok(()), Some(account)) => account,
-            (Ok(()), None) => return,
+        let (account, pointers) = match (result, self.account(&chat.account)) {
+            (Ok(pointers), Some(account)) => (account, pointers),
+            (Ok(_), None) => return,
             (Err(err), _) => {
                 tracing::warn!(%err, %chat, "sending failed");
                 self.ui.show_error(&format!("Not sent: {err}"));
-                self.ui.restore_draft(&chat, &text);
+                self.ui.restore_draft(&chat, &text, images);
                 self.chat_dirty.set(true);
                 self.schedule_refresh();
                 return;
@@ -814,6 +851,17 @@ impl Controller {
             author_name: None,
             timestamp,
             body: text,
+            attachments: images
+                .iter()
+                .zip(pointers)
+                .map(|(staged, pointer)| NewAttachment {
+                    content_type: staged.image.content_type.clone(),
+                    file_name: staged.image.file_name.clone(),
+                    width: staged.image.width,
+                    height: staged.image.height,
+                    pointer,
+                })
+                .collect(),
             expires_in,
         };
         if let Err(err) = account
@@ -823,12 +871,109 @@ impl Controller {
         {
             tracing::error!(%err, "storing sent message failed");
         }
+        self.save_sent_images(&account, &message, &images);
+        self.chat_dirty.set(true);
+        self.schedule_refresh();
+    }
+
+    /// Keeps a copy of the images we sent. One that can't be saved is
+    /// downloaded again when its chat is opened.
+    fn save_sent_images(&self, account: &Account, message: &NewMessage, images: &[StagedImage]) {
+        let store = account.store.borrow();
+        let ids = match store.message_attachments(
+            &message.conversation,
+            &Author::Me,
+            message.timestamp,
+        ) {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::error!(%err, "looking up sent images failed");
+                return;
+            }
+        };
+        for (id, staged) in ids.into_iter().zip(images) {
+            let file = attachment_file(id, &staged.image.content_type);
+            let saved = std::fs::write(account.attachments.join(&file), &staged.image.data)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| store.set_attachment_file(id, &file));
+            if let Err(err) = saved {
+                tracing::error!(%err, "saving a sent image failed");
+            }
+        }
+    }
+
+    /// Downloads the images of the conversation's recent messages that are
+    /// missing. Those that failed before are only retried if asked to.
+    fn fetch_missing_attachments(
+        &self,
+        account: &Rc<Account>,
+        conversation: &ConversationId,
+        retry_failed: bool,
+    ) {
+        if account.backend.borrow().is_none() {
+            return;
+        }
+        let missing = match account.store.borrow().missing_attachments(conversation) {
+            Ok(missing) => missing,
+            Err(err) => {
+                tracing::error!(%err, "listing missing images failed");
+                return;
+            }
+        };
+        for image in missing {
+            if account.downloading.borrow().contains(&image.id)
+                || (!retry_failed && account.failed.borrow().contains(&image.id))
+            {
+                continue;
+            }
+            account.failed.borrow_mut().remove(&image.id);
+            account.downloading.borrow_mut().insert(image.id);
+            if let Some(this) = self.weak_self.upgrade() {
+                glib::spawn_future_local(this.download(Rc::downgrade(account), image));
+            }
+        }
+    }
+
+    async fn download(self: Rc<Self>, account: Weak<Account>, image: MissingAttachment) {
+        let file = attachment_file(image.id, &image.content_type);
+        let Some(download) = self.live_account(&account).and_then(|account| {
+            let backend = account.backend.borrow();
+            Some(
+                backend
+                    .as_ref()?
+                    .download(image.pointer, account.attachments.join(&file)),
+            )
+        }) else {
+            return;
+        };
+        let result = download.await;
+        // Removing the account deleted its files.
+        let Some(account) = self.live_account(&account) else {
+            return;
+        };
+        account.downloading.borrow_mut().remove(&image.id);
+        match result {
+            Ok(()) => match account.store.borrow().set_attachment_file(image.id, &file) {
+                Ok(Some(conversation)) => {
+                    self.touch(&account.chat(conversation));
+                    return;
+                }
+                // Its message was deleted meanwhile.
+                Ok(None) => account.remove_files(vec![file]),
+                Err(err) => tracing::error!(%err, "recording a downloaded image failed"),
+            },
+            // Already logged by the backend.
+            Err(_) => {
+                account.failed.borrow_mut().insert(image.id);
+            }
+        }
+        // Shows the failure if its chat is open.
         self.chat_dirty.set(true);
         self.schedule_refresh();
     }
 
     /// Applies one event from Signal to the account's store and the UI.
-    fn apply(&self, account: &Account, event: SignalEvent, origin: Origin) {
+    fn apply(&self, account: &Rc<Account>, event: SignalEvent, origin: Origin) {
         if let SignalEvent::Message(message) = &event {
             if let Err(err) = self.apply_message(account, message, origin) {
                 tracing::error!(%err, kind = event.kind(), "applying signal event failed");
@@ -856,7 +1001,11 @@ impl Controller {
                     target,
                 } => store
                     .delete_message(conversation, author, *target)
-                    .map(|found| with_conversation(found, conversation)),
+                    .map(|files| {
+                        let found = files.is_some();
+                        account.remove_files(files.unwrap_or_default());
+                        with_conversation(found, conversation)
+                    }),
                 SignalEvent::ReadElsewhere { sender, timestamp } => {
                     store.mark_read_elsewhere(sender, *timestamp)
                 }
@@ -891,7 +1040,7 @@ impl Controller {
 
     fn apply_message(
         &self,
-        account: &Account,
+        account: &Rc<Account>,
         message: &NewMessage,
         origin: Origin,
     ) -> anyhow::Result<()> {
@@ -905,6 +1054,10 @@ impl Controller {
         }
         let chat = account.chat(message.conversation.clone());
         self.touch(&chat);
+        // History's images are fetched when its chat is opened.
+        if origin == Origin::Live && !message.attachments.is_empty() {
+            self.fetch_missing_attachments(account, &message.conversation, false);
+        }
         if read == ReadState::Unread {
             if self.ui.is_viewing(&chat) {
                 self.mark_seen(&chat);
@@ -935,19 +1088,19 @@ impl Controller {
             Ok(Some(summary)) => summary.name,
             _ => "Signal".to_owned(),
         };
+        let text = model::text_with_images(&message.body, message.attachments.len());
         let body = match (&message.conversation, &message.author) {
             (ConversationId::Group(_), Author::Peer(peer)) => {
                 format!(
-                    "{}: {}",
+                    "{}: {text}",
                     peer_display_name(
                         &account.store.borrow(),
                         peer,
                         message.author_name.as_deref()
                     ),
-                    message.body
                 )
             }
-            _ => message.body.clone(),
+            _ => text,
         };
         let chat = account.chat(message.conversation.clone()).to_string();
         let notification = gio::Notification::new(&title);
@@ -1040,10 +1193,27 @@ impl Controller {
                         (MessageStatus::Incoming, sender)
                     }
                 };
+                let images = m
+                    .attachments
+                    .into_iter()
+                    .map(|image| ImageView {
+                        state: match &image.file {
+                            Some(file) => ImageState::Ready(account.attachments.join(file)),
+                            None if account.failed.borrow().contains(&image.id) => {
+                                ImageState::Unavailable
+                            }
+                            None => ImageState::Loading,
+                        },
+                        file_name: image.file_name,
+                        width: image.width,
+                        height: image.height,
+                    })
+                    .collect();
                 MessageView {
                     status,
                     sender,
                     body: m.body,
+                    images,
                     timestamp: m.timestamp,
                     edited: m.edited,
                     deleted: m.deleted,

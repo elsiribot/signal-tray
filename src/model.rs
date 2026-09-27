@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Milliseconds since the Unix epoch, as used by Signal for message ids.
@@ -176,8 +177,61 @@ pub struct NewMessage {
     pub author_name: Option<String>,
     pub timestamp: Timestamp,
     pub body: String,
+    pub attachments: Vec<NewAttachment>,
     /// Disappearing-message timer; `None` when off.
     pub expires_in: Option<Duration>,
+}
+
+/// An image attached to a message, before it is downloaded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewAttachment {
+    /// A MIME type, `image/…`.
+    pub content_type: String,
+    pub file_name: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// Signal's protobuf-encoded `AttachmentPointer`: where the image is
+    /// and how to decrypt it. Opaque outside the backend.
+    pub pointer: Vec<u8>,
+}
+
+/// An image to send.
+#[derive(Clone, Debug)]
+pub struct OutgoingImage {
+    /// A MIME type, `image/…`.
+    pub content_type: String,
+    pub file_name: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub data: Arc<[u8]>,
+}
+
+/// A message as one piece of text, for the chat list and notifications:
+/// the body, marked when images are attached.
+pub fn text_with_images(body: &str, images: usize) -> String {
+    match (images, body.is_empty()) {
+        (0, _) => body.to_owned(),
+        (1, true) => "🖼 Photo".to_owned(),
+        (n, true) => format!("🖼 {n} photos"),
+        (_, false) => format!("🖼 {body}"),
+    }
+}
+
+/// File name extension for an image's MIME type.
+pub fn file_extension(content_type: &str) -> &'static str {
+    match content_type {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/heic" => "heic",
+        "image/heif" => "heif",
+        "image/avif" => "avif",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tiff",
+        "image/svg+xml" => "svg",
+        _ => "img",
+    }
 }
 
 /// Something that happened on the Signal side and needs to be reflected
@@ -267,6 +321,14 @@ mod tests {
         assert!("d:peer".parse::<ChatRef>().is_err(), "account is required");
         assert!("/d:peer".parse::<ChatRef>().is_err());
         assert!("1/x:peer".parse::<ChatRef>().is_err());
+    }
+
+    #[test]
+    fn images_are_marked_in_text() {
+        assert_eq!(text_with_images("hi", 0), "hi");
+        assert_eq!(text_with_images("", 1), "🖼 Photo");
+        assert_eq!(text_with_images("", 3), "🖼 3 photos");
+        assert_eq!(text_with_images("look", 2), "🖼 look");
     }
 
     #[test]

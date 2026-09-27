@@ -4,6 +4,7 @@
 //! accounts/<id>/presage.sqlite          presage's keys, sessions, contacts, groups
 //! accounts/<id>/messages.sqlite         the app's message history
 //! accounts/<id>/history-import-pending  while Link & Sync is unfinished
+//! accounts/<id>/attachments/            downloaded and sent images
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ const ACCOUNTS_DIR: &str = "accounts";
 const PRESAGE_DB: &str = "presage.sqlite";
 const MESSAGES_DB: &str = "messages.sqlite";
 const HISTORY_MARKER: &str = "history-import-pending";
+const ATTACHMENTS_DIR: &str = "attachments";
 
 /// The account the files of the single-account layout move to.
 const MIGRATED_ID: &str = "1";
@@ -26,6 +28,7 @@ pub struct AccountPaths {
     pub presage: PathBuf,
     pub messages: PathBuf,
     pub history_marker: PathBuf,
+    pub attachments: PathBuf,
 }
 
 pub fn paths(data_dir: &Path, id: &AccountId) -> AccountPaths {
@@ -34,6 +37,7 @@ pub fn paths(data_dir: &Path, id: &AccountId) -> AccountPaths {
         presage: dir.join(PRESAGE_DB),
         messages: dir.join(MESSAGES_DB),
         history_marker: dir.join(HISTORY_MARKER),
+        attachments: dir.join(ATTACHMENTS_DIR),
         dir,
     }
 }

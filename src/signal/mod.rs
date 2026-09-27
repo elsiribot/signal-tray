@@ -15,24 +15,26 @@ mod convert;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Duration;
 
 use futures::{StreamExt as _, future, pin_mut};
 use presage::Manager;
 use presage::libsignal_service::backup::MessageBackupKey;
 use presage::libsignal_service::configuration::SignalServers;
-use presage::libsignal_service::prelude::{ProfileKey, Uuid};
+use presage::libsignal_service::prelude::{ProfileKey, ProtobufMessage as _, Uuid};
 use presage::libsignal_service::protocol::{Aci, ServiceId};
+use presage::libsignal_service::sender::AttachmentSpec;
 use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
 use presage::proto::receipt_message::Type as ReceiptType;
-use presage::proto::{DataMessage, ReceiptMessage};
+use presage::proto::{AttachmentPointer, DataMessage, ReceiptMessage};
 use presage::store::{ContentsStore as _, Thread};
 use presage_store_sqlite::SqliteStore;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 
-use crate::model::{ConversationId, PeerId, SignalEvent, Timestamp};
+use crate::model::{ConversationId, OutgoingImage, PeerId, SignalEvent, Timestamp};
 pub use convert::Origin;
 use convert::{
     Names, Source, content_events, group_conversation, group_master_key, peer_id, service_id,
@@ -45,6 +47,8 @@ const HISTORY_BATCH: usize = 500;
 const THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 /// Upper bound for the reconnect backoff.
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+/// Images downloaded at the same time.
+const PARALLEL_DOWNLOADS: usize = 3;
 
 pub struct SpawnOptions {
     /// Names the thread and tags its logs.
@@ -66,6 +70,16 @@ pub enum SendError {
     InvalidRecipient,
     #[error("{0}")]
     Signal(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DownloadError {
+    #[error("not connected to Signal")]
+    Offline,
+    #[error("{0}")]
+    Signal(String),
+    #[error("saving failed: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub enum HistoryStatus {
@@ -115,8 +129,14 @@ enum Command {
     Send {
         conversation: ConversationId,
         text: String,
+        images: Vec<OutgoingImage>,
         timestamp: Timestamp,
-        done: oneshot::Sender<Result<(), SendError>>,
+        done: oneshot::Sender<Result<Vec<Vec<u8>>, SendError>>,
+    },
+    Download {
+        pointer: Vec<u8>,
+        dest: PathBuf,
+        done: oneshot::Sender<Result<(), DownloadError>>,
     },
     ReadReceipts {
         sender: PeerId,
@@ -164,20 +184,26 @@ impl Backend {
         let _ = self.commands.send(Command::RetryLink);
     }
 
+    /// Sends text with images, either of which may be empty. Resolves to
+    /// the uploaded images' pointers (see [`crate::model::NewAttachment`]), in
+    /// order.
+    ///
     /// The returned future doesn't borrow the backend, which may be
     /// dropped (its account removed) while the send is in flight.
-    pub fn send_text(
+    pub fn send(
         &self,
         conversation: &ConversationId,
         text: &str,
+        images: Vec<OutgoingImage>,
         timestamp: Timestamp,
-    ) -> impl Future<Output = Result<(), SendError>> + use<> {
+    ) -> impl Future<Output = Result<Vec<Vec<u8>>, SendError>> + use<> {
         let (done, result) = oneshot::channel();
         let queued = self
             .commands
             .send(Command::Send {
                 conversation: conversation.clone(),
                 text: text.to_owned(),
+                images,
                 timestamp,
                 done,
             })
@@ -187,6 +213,31 @@ impl Backend {
                 return Err(SendError::Offline);
             }
             result.await.map_err(|_| SendError::Offline)?
+        }
+    }
+
+    /// Downloads and decrypts the attachment `pointer` describes (see
+    /// [`crate::model::NewAttachment`]) into `dest`. Fails while offline.
+    pub fn download(
+        &self,
+        pointer: Vec<u8>,
+        dest: PathBuf,
+    ) -> impl Future<Output = Result<(), DownloadError>> + use<> {
+        let (done, result) = oneshot::channel();
+        let queued = self
+            .commands
+            .send(Command::Download {
+                pointer,
+                dest,
+                done,
+            })
+            .is_ok();
+        async move {
+            if !queued {
+                return Err(DownloadError::Offline);
+            }
+            // Commands are dropped, not answered, while offline.
+            result.await.map_err(|_| DownloadError::Offline)?
         }
     }
 
@@ -319,6 +370,9 @@ fn reject_while_linking(command: Command) {
     match command {
         Command::Send { done, .. } => {
             let _ = done.send(Err(SendError::Offline));
+        }
+        Command::Download { done, .. } => {
+            let _ = done.send(Err(DownloadError::Offline));
         }
         Command::RetryLink | Command::ReadReceipts { .. } => {}
     }
@@ -508,6 +562,7 @@ async fn receive_loop(
     mut commands: Commands,
 ) -> anyhow::Result<()> {
     let mut delay = Duration::from_secs(1);
+    let downloads = Rc::new(Semaphore::new(PARALLEL_DOWNLOADS));
     loop {
         let mut receiver = manager.clone();
         match receiver.receive_messages().await {
@@ -526,7 +581,7 @@ async fn receive_loop(
                             None => break,
                         },
                         command = commands.recv() => match command {
-                            Some(command) => handle_command(command, &manager),
+                            Some(command) => handle_command(command, &manager, &downloads),
                             None => return Ok(()),
                         },
                     }
@@ -545,6 +600,9 @@ async fn receive_loop(
                 command = commands.recv() => match command {
                     Some(Command::Send { done, .. }) => {
                         let _ = done.send(Err(SendError::Offline));
+                    }
+                    Some(Command::Download { done, .. }) => {
+                        let _ = done.send(Err(DownloadError::Offline));
                     }
                     Some(_) => {}
                     None => return Ok(()),
@@ -593,7 +651,11 @@ async fn on_received(
     Ok(())
 }
 
-fn handle_command(command: Command, manager: &Manager<SqliteStore, Registered>) {
+fn handle_command(
+    command: Command,
+    manager: &Manager<SqliteStore, Registered>,
+    downloads: &Rc<Semaphore>,
+) {
     let mut manager = manager.clone();
     match command {
         // Only meaningful while linking.
@@ -601,13 +663,31 @@ fn handle_command(command: Command, manager: &Manager<SqliteStore, Registered>) 
         Command::Send {
             conversation,
             text,
+            images,
             timestamp,
             done,
         } => {
             tokio::task::spawn_local(async move {
-                let result = send_text(&mut manager, &conversation, text, timestamp).await;
+                let result = send(&mut manager, &conversation, text, images, timestamp).await;
                 if let Err(err) = &result {
                     tracing::warn!(%err, %conversation, "sending failed");
+                }
+                let _ = done.send(result);
+            });
+        }
+        Command::Download {
+            pointer,
+            dest,
+            done,
+        } => {
+            let downloads = downloads.clone();
+            tokio::task::spawn_local(async move {
+                let result = match downloads.acquire().await {
+                    Ok(_permit) => download(&manager, &pointer, &dest).await,
+                    Err(_) => Err(DownloadError::Offline),
+                };
+                if let Err(err) = &result {
+                    tracing::warn!(%err, "downloading an attachment failed");
                 }
                 let _ = done.send(result);
             });
@@ -633,15 +713,18 @@ fn handle_command(command: Command, manager: &Manager<SqliteStore, Registered>) 
     }
 }
 
-async fn send_text(
+async fn send(
     manager: &mut Manager<SqliteStore, Registered>,
     conversation: &ConversationId,
     text: String,
+    images: Vec<OutgoingImage>,
     timestamp: Timestamp,
-) -> Result<(), SendError> {
+) -> Result<Vec<Vec<u8>>, SendError> {
     let ts = u64::try_from(timestamp.0).map_err(|_| SendError::InvalidRecipient)?;
+    let attachments = upload(manager, images).await?;
     let message = DataMessage {
-        body: Some(text),
+        body: (!text.is_empty()).then_some(text),
+        attachments: attachments.clone(),
         timestamp: Some(ts),
         ..Default::default()
     };
@@ -657,7 +740,53 @@ async fn send_text(
                 .await
         }
     };
-    result.map_err(|err| SendError::Signal(err.to_string()))
+    result.map_err(|err| SendError::Signal(err.to_string()))?;
+    Ok(attachments.iter().map(|a| a.encode_to_vec()).collect())
+}
+
+async fn upload(
+    manager: &Manager<SqliteStore, Registered>,
+    images: Vec<OutgoingImage>,
+) -> Result<Vec<AttachmentPointer>, SendError> {
+    let specs = images
+        .into_iter()
+        .map(|image| {
+            let spec = AttachmentSpec {
+                content_type: image.content_type,
+                length: image.data.len(),
+                file_name: image.file_name,
+                width: image.width,
+                height: image.height,
+                ..Default::default()
+            };
+            (spec, image.data.to_vec())
+        })
+        .collect();
+    manager
+        .upload_attachments(specs)
+        .await
+        .map_err(|err| SendError::Signal(err.to_string()))?
+        .into_iter()
+        .map(|uploaded| uploaded.map_err(|err| SendError::Signal(err.to_string())))
+        .collect()
+}
+
+/// Writes through a temporary file, so `dest` is either complete or absent.
+async fn download(
+    manager: &Manager<SqliteStore, Registered>,
+    pointer: &[u8],
+    dest: &Path,
+) -> Result<(), DownloadError> {
+    let pointer = AttachmentPointer::decode(pointer)
+        .map_err(|err| DownloadError::Signal(format!("invalid attachment pointer: {err}")))?;
+    let data = manager
+        .get_attachment(&pointer)
+        .await
+        .map_err(|err| DownloadError::Signal(err.to_string()))?;
+    let partial = dest.with_extension("part");
+    std::fs::write(&partial, data)?;
+    std::fs::rename(&partial, dest)?;
+    Ok(())
 }
 
 fn now_ms() -> i64 {

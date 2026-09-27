@@ -9,15 +9,17 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use presage::libsignal_service::content::{Content, ContentBody};
+use presage::libsignal_service::prelude::ProtobufMessage as _;
 use presage::libsignal_service::protocol::ServiceId;
 use presage::proto::body_range::AssociatedValue;
 use presage::proto::data_message::Flags;
 use presage::proto::receipt_message::Type as ReceiptType;
 use presage::proto::sync_message::{self, Sent};
-use presage::proto::{DataMessage, EditMessage, ReceiptMessage, SyncMessage};
+use presage::proto::{AttachmentPointer, DataMessage, EditMessage, ReceiptMessage, SyncMessage};
 
 use crate::model::{
-    Author, ConversationId, DeliveryStatus, NewMessage, PeerId, SignalEvent, Timestamp,
+    Author, ConversationId, DeliveryStatus, NewAttachment, NewMessage, PeerId, SignalEvent,
+    Timestamp,
 };
 
 /// Display names used to render @mentions.
@@ -169,7 +171,8 @@ fn data_event(
         return None;
     }
     let body = render_body(data, names);
-    if body.is_empty() {
+    let attachments = inline_attachments(data);
+    if body.is_empty() && attachments.is_empty() {
         // Profile key updates, session resets, group updates, etc.
         return None;
     }
@@ -183,6 +186,7 @@ fn data_event(
         author_name: None,
         timestamp,
         body,
+        attachments,
         expires_in,
     }))
 }
@@ -198,7 +202,8 @@ fn edit_event(
     let conversation = route.conversation(data)?;
     let target = Timestamp(i64::try_from(edit.target_sent_timestamp?).ok()?);
     let body = render_body(data, names);
-    if body.is_empty() {
+    let attachments = inline_attachments(data);
+    if body.is_empty() && attachments.is_empty() {
         return None;
     }
     Some(match origin {
@@ -216,6 +221,7 @@ fn edit_event(
             author_name: None,
             timestamp: target,
             body,
+            attachments,
             expires_in: expires_in(data),
         }),
     })
@@ -243,7 +249,38 @@ fn expires_in(data: &DataMessage) -> Option<Duration> {
         .map(|s| Duration::from_secs(s.into()))
 }
 
-/// Flattens text, mentions, quotes and attachments into plain text.
+fn is_image(attachment: &AttachmentPointer) -> bool {
+    attachment
+        .content_type
+        .as_deref()
+        .is_some_and(|t| t.starts_with("image/"))
+}
+
+/// View-once media is for the phone; it's neither downloaded nor shown.
+fn is_view_once(data: &DataMessage) -> bool {
+    data.is_view_once == Some(true)
+}
+
+/// The image attachments, to be downloaded and shown inline.
+fn inline_attachments(data: &DataMessage) -> Vec<NewAttachment> {
+    if is_view_once(data) {
+        return Vec::new();
+    }
+    data.attachments
+        .iter()
+        .filter(|a| is_image(a))
+        .map(|a| NewAttachment {
+            content_type: a.content_type.clone().unwrap_or_default(),
+            file_name: a.file_name.clone().filter(|n| !n.is_empty()),
+            width: a.width.filter(|w| *w > 0),
+            height: a.height.filter(|h| *h > 0),
+            pointer: a.encode_to_vec(),
+        })
+        .collect()
+}
+
+/// Flattens text, mentions, quotes and non-image attachments into plain
+/// text.
 fn render_body(data: &DataMessage, names: &Names) -> String {
     let mut lines = Vec::new();
     if let Some(text) = data.quote.as_ref().and_then(|q| q.text.as_deref()) {
@@ -256,7 +293,11 @@ fn render_body(data: &DataMessage, names: &Names) -> String {
     if data.sticker.is_some() {
         lines.push("[sticker]".to_owned());
     }
-    for attachment in &data.attachments {
+    if is_view_once(data) {
+        lines.push("[view-once media]".to_owned());
+        return lines.join("\n");
+    }
+    for attachment in data.attachments.iter().filter(|a| !is_image(a)) {
         let name = attachment
             .file_name
             .as_deref()
@@ -361,6 +402,7 @@ mod tests {
                 author_name: None,
                 timestamp: Timestamp(1_000),
                 body: "hi".into(),
+                attachments: Vec::new(),
                 expires_in: None,
             })]
         );
@@ -387,7 +429,8 @@ mod tests {
                 ..Default::default()
             }),
             attachments: vec![AttachmentPointer {
-                content_type: Some("image/jpeg".into()),
+                content_type: Some("application/pdf".into()),
+                file_name: Some("plan.pdf".into()),
                 ..Default::default()
             }],
             ..Default::default()
@@ -402,7 +445,7 @@ mod tests {
             panic!("expected one message, got {events:?}");
         };
         assert_eq!(msg.conversation, group_conversation(&key));
-        assert_eq!(msg.body, "› earlier\nhey @Alice!\n📎 image/jpeg");
+        assert_eq!(msg.body, "› earlier\nhey @Alice!\n📎 plan.pdf");
         assert_eq!(msg.expires_in, Some(Duration::from_secs(60)));
         assert_eq!(group_master_key(&BASE64.encode(key)), Some(key));
     }
@@ -437,6 +480,7 @@ mod tests {
                     author_name: None,
                     timestamp: Timestamp(7),
                     body: "from phone".into(),
+                    attachments: Vec::new(),
                     expires_in: None,
                 }),
                 SignalEvent::ReadElsewhere {
@@ -512,6 +556,88 @@ mod tests {
                 &Names::new()
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn image_attachments_become_images() {
+        let photo = AttachmentPointer {
+            content_type: Some("image/jpeg".into()),
+            file_name: Some("IMG_1.jpg".into()),
+            width: Some(640),
+            height: Some(0),
+            size: Some(1234),
+            ..Default::default()
+        };
+        let data = DataMessage {
+            timestamp: Some(3),
+            attachments: vec![
+                photo.clone(),
+                AttachmentPointer {
+                    content_type: Some("video/mp4".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let events = content_events(
+            &content(ALICE, ContentBody::DataMessage(data.clone())),
+            Source::Live,
+            &Names::new(),
+        );
+        let [SignalEvent::Message(msg)] = events.as_slice() else {
+            panic!("expected one message, got {events:?}");
+        };
+        assert_eq!(
+            msg.body, "📎 video/mp4",
+            "other attachments stay in the text"
+        );
+        assert_eq!(
+            msg.attachments,
+            vec![NewAttachment {
+                content_type: "image/jpeg".into(),
+                file_name: Some("IMG_1.jpg".into()),
+                width: Some(640),
+                height: None,
+                pointer: photo.encode_to_vec(),
+            }]
+        );
+        assert_eq!(
+            AttachmentPointer::decode(msg.attachments[0].pointer.as_slice()).expect("decodes"),
+            photo
+        );
+
+        // A photo without a caption is still a message.
+        let only_photo = DataMessage {
+            attachments: vec![photo.clone()],
+            ..data.clone()
+        };
+        let events = content_events(
+            &content(ALICE, ContentBody::DataMessage(only_photo)),
+            Source::Live,
+            &Names::new(),
+        );
+        let [SignalEvent::Message(msg)] = events.as_slice() else {
+            panic!("expected one message, got {events:?}");
+        };
+        assert_eq!((msg.body.as_str(), msg.attachments.len()), ("", 1));
+
+        let view_once = DataMessage {
+            attachments: vec![photo],
+            is_view_once: Some(true),
+            ..data
+        };
+        let events = content_events(
+            &content(ALICE, ContentBody::DataMessage(view_once)),
+            Source::Live,
+            &Names::new(),
+        );
+        let [SignalEvent::Message(msg)] = events.as_slice() else {
+            panic!("expected one message, got {events:?}");
+        };
+        assert_eq!(
+            (msg.body.as_str(), msg.attachments.len()),
+            ("[view-once media]", 0)
         );
     }
 
