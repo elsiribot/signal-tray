@@ -1,0 +1,40 @@
+[package]
+name = "signal-tray"
+version = "0.1.0"
+edition = "2024"
+# presage (the Signal client library) is AGPL-3.0-only.
+license = "AGPL-3.0-only"
+
+[dependencies]
+anyhow = "1.0.104"
+async-channel = "2.5.0"
+gtk = { version = "0.11.5", package = "gtk4", features = ["v4_14", "gio_v2_80"] }
+gtk4-layer-shell = "0.8.1"
+ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
+qrcode = { version = "0.14.1", default-features = false }
+# Pinned to the libsqlite3-sys that presage-store-sqlite links (SQLCipher).
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+presage = { git = "https://github.com/fifteenlabs/presage", rev = "39a2929" }
+presage-store-sqlite = { git = "https://github.com/fifteenlabs/presage", rev = "39a2929" }
+tokio = { version = "1.48", features = ["rt", "macros", "sync", "time"] }
+futures = "0.3"
+base64 = { version = "0.22", default-features = false }
+uuid = { version = "1", default-features = false }
+url = "2"
+
+# presage's workspace patches don't propagate to dependents; mirror them.
+[dev-dependencies]
+# Only to build message metadata in tests.
+chrono = { version = "0.4", default-features = false }
+
+[patch.crates-io]
+libsqlite3-sys = { git = "https://github.com/whisperfish/rusqlite", rev = "2a42b3354c9194700d08aa070f70a131a470e7dc" }
+
+[patch."https://github.com/whisperfish/libsignal-service-rs.git"]
+libsignal-service = { git = "https://github.com/fifteenlabs/libsignal-service-rs", rev = "a76d309b2fd78b3a4f49e917e8d44022aadc7f53" }

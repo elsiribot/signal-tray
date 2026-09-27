@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Signal Tray
+Comment=Compact keyboard-driven Signal client
+Exec=signal-tray
+Icon=internet-chat
+Terminal=false
+Categories=Network;InstantMessaging;
+StartupNotify=false

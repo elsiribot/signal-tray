@@ -1,0 +1,197 @@
+/* Compact look: small type, tight paddings, no decoration. Colours derive
+ * from the theme's foreground so light and dark themes both work. */
+
+window.signal-tray {
+  font-size: 0.92em;
+  border: 1px solid alpha(currentColor, 0.18);
+  border-radius: 8px;
+}
+
+.dim,
+.time,
+.preview,
+.meta,
+.day,
+.placeholder {
+  opacity: 0.6;
+}
+
+.title {
+  font-weight: bold;
+  font-size: 1.1em;
+}
+
+.banner {
+  padding: 4px 8px;
+  background: #c62828;
+  color: white;
+}
+
+.page {
+  margin: 12px;
+}
+
+.qr {
+  border-radius: 4px;
+}
+
+/* chat list */
+
+entry.search,
+searchentry.search {
+  margin: 6px;
+  min-height: 26px;
+}
+
+.chat-list {
+  background: transparent;
+}
+
+.chat-list row {
+  padding: 0;
+}
+
+.conversation {
+  padding: 4px 8px;
+}
+
+.conversation .name.unread {
+  font-weight: bold;
+}
+
+.time,
+.meta,
+.day,
+.sender {
+  font-size: 0.82em;
+}
+
+.chat-list row:selected .badge {
+  background: white;
+  color: #2c6bed;
+}
+
+.badge {
+  font-size: 0.78em;
+  font-weight: bold;
+  min-width: 14px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: #3a76f0;
+  color: white;
+}
+
+/* chat */
+
+.chat-header {
+  padding: 2px 4px;
+  border-bottom: 1px solid alpha(currentColor, 0.12);
+}
+
+.chat-header button.back {
+  min-height: 22px;
+  min-width: 22px;
+  padding: 2px;
+}
+
+.chat-title {
+  font-weight: bold;
+  margin-left: 2px;
+}
+
+.messages {
+  background: transparent;
+  padding: 4px 0;
+}
+
+.messages row,
+.messages row:hover {
+  padding: 0;
+  background: transparent;
+}
+
+.day {
+  margin: 6px 0 2px 0;
+}
+
+.bubble {
+  margin: 1px 8px;
+  padding: 3px 8px;
+  border-radius: 10px;
+}
+
+.bubble.incoming {
+  background: alpha(currentColor, 0.09);
+  margin-right: 40px;
+}
+
+.bubble.outgoing {
+  background: #2c6bed;
+  color: white;
+  margin-left: 40px;
+}
+
+.sender {
+  font-weight: bold;
+  color: #3a76f0;
+}
+
+.deleted {
+  font-style: italic;
+  opacity: 0.7;
+}
+
+.meta.read {
+  opacity: 1;
+  font-weight: bold;
+}
+
+.compose-box {
+  margin: 4px 6px 6px 6px;
+  border: 1px solid alpha(currentColor, 0.2);
+  border-radius: 8px;
+}
+
+.compose-box:focus-within {
+  border-color: #3a76f0;
+}
+
+textview.compose,
+textview.compose text {
+  background: transparent;
+}
+
+textview.compose {
+  padding: 4px 8px;
+}
+
+.compose-box .placeholder {
+  /* Matches the text view's padding, so it sits where the cursor is. */
+  margin: 4px 0 0 9px;
+}
+
+/* help */
+
+.help {
+  margin: 8px 10px;
+}
+
+.help .heading {
+  font-weight: bold;
+  margin-top: 6px;
+}
+
+.help .key {
+  font-family: monospace;
+  font-size: 0.9em;
+}
+
+/* settings */
+
+.signal-tray-settings .heading {
+  font-weight: bold;
+}
+
+.signal-tray-settings .heading:not(:first-child) {
+  margin-top: 12px;
+}
