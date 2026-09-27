@@ -14,6 +14,8 @@ touching the mouse.
   Clicking one opens that chat.
 - Read receipts, delivery ticks (✓ sent, ✓✓ delivered, bold ✓✓ read), edits,
   remote deletes, and sync with messages you send from your phone.
+- Several accounts side by side, their chats in one list. Each account has
+  a colour that marks its chats and your messages.
 - Disappearing messages are honoured: they're deleted from the local store
   when their timer runs out. The timer counts from sending, not from
   reading, so they may vanish a little early.
@@ -54,13 +56,27 @@ Until the first message arrives, the list shows all contacts and groups
 alphabetically; after that it shows chats only, and contacts are found by
 typing.
 
+### More accounts
+
+Settings (`Ctrl+,` or the tray menu) → **Add account…** shows a new QR code;
+link it like the first. All accounts' chats are shown in one list, most
+recent first. The same person in two accounts is two chats, and replies
+always go out from the account a chat belongs to.
+
+With more than one account, a stripe in the account's colour marks each chat
+in the list, and the chat header shows the account's name. Your own messages
+are always drawn in the account's colour. Name and colour are changed in the
+settings, next to each account; the name starts out as the phone number.
+Removing an account there deletes its messages from this computer; remove
+the linked device on your phone as well.
+
 ### Try it without an account
 
 ```sh
 signal-tray --demo
 ```
 
-This shows sample chats from an in-memory store. It runs as a separate app
+This shows sample chats of two accounts from an in-memory store. It runs as a separate app
 instance, so it never touches your real data.
 
 ## Global shortcut (sway)
@@ -117,23 +133,37 @@ start_hidden = false        # same as --hidden
 hide_on_focus_loss = false  # hide when another window gets focus
 notifications = true
 device_name = "signal-tray" # shown in the phone's linked devices list
+
+# One per linked account, added when linking. Changed in the settings.
+[[accounts]]
+id = "1"                    # names its data directory, see below
+name = "Personal"           # shown next to the chat title
+color = "#2c6bed"
 ```
 
 Unknown keys are rejected, so typos don't pass silently.
 
-Opacity and hiding on focus loss can also be set live in the settings
+Opacity, hiding on focus loss and each account's name and colour can also
+be set live in the settings
 window (tray menu → Settings…, or `Ctrl+,`). On sway, Super+drag (or Alt+drag) moves the window; on release it snaps
 to the nearest corner, keeping its distance from the edges, and `corner` and
 `margin` are updated. Both rewrite the file, dropping any comments.
 
 ## Files
 
-- `~/.local/share/signal-tray/messages.sqlite`: your messages, as shown in
-  the window
-- `~/.local/share/signal-tray/presage.sqlite`: Signal keys, sessions,
-  contacts and groups (presage's store). presage also writes each message
-  there as it arrives; those copies are moved into `messages.sqlite` and
-  deleted on the next start, so there's one long-lived copy of each message.
+Each account has a directory `~/.local/share/signal-tray/accounts/<id>/`
+with:
+
+- `messages.sqlite`: your messages, as shown in the window
+- `presage.sqlite`: Signal keys, sessions, contacts and groups (presage's
+  store). presage also writes each message there as it arrives; those
+  copies are moved into `messages.sqlite` and deleted on the next start, so
+  there's one long-lived copy of each message.
+
+Versions before multi-account support kept both files directly in
+`~/.local/share/signal-tray/`; they're moved into `accounts/1/` on the first
+start. An account directory that isn't listed in the config is left over
+from linking that never finished, and is deleted on start.
 
 Neither file is encrypted yet; the directory is only accessible to your
 user (mode 0700).
@@ -145,7 +175,7 @@ Message contents are not logged.
 
 Sending or opening attachments (received ones show as `📎 name`),
 reactions, typing indicators, voice/video, stickers (shown as `[sticker]`),
-changing a chat's disappearing-message timer, multiple accounts.
+changing a chat's disappearing-message timer.
 
 ## Development
 
@@ -156,11 +186,12 @@ just test
 just clippy
 ```
 
-Layout: `model.rs` holds the domain types, `signal/convert.rs` turns
-decrypted Signal messages into domain events (unit tested), `store.rs` is the
-SQLite history (unit tested), `signal/mod.rs` runs presage on its own thread,
-`app.rs` is the controller, `ui/` is the GTK window, and
-`tray.rs` is the tray icon.
+Layout: `model.rs` holds the domain types, `accounts.rs` the per-account
+file layout, `signal/convert.rs` turns decrypted Signal messages into domain
+events (unit tested), `store.rs` is the SQLite history of one account (unit
+tested), `signal/mod.rs` runs presage for one account on its own thread,
+`app.rs` is the controller, `ui/` is the GTK window, and `tray.rs` is the
+tray icon.
 
 ## License
 

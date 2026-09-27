@@ -58,6 +58,87 @@ impl FromStr for ConversationId {
     }
 }
 
+/// One of the linked Signal accounts. Local only: it names the account's
+/// data directory and never leaves the machine.
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Deserialize, serde::Serialize,
+)]
+#[serde(try_from = "String", into = "String")]
+pub struct AccountId(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid account id {0:?}: use letters, digits, '-' and '_'")]
+pub struct InvalidAccountId(String);
+
+impl AccountId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Restricted so the id is safe as a directory name and CSS class, and
+/// can't contain the separator of [`ChatRef`]'s string form.
+impl TryFrom<String> for AccountId {
+    type Error = InvalidAccountId;
+
+    fn try_from(id: String) -> Result<Self, Self::Error> {
+        let valid = !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if valid {
+            Ok(Self(id))
+        } else {
+            Err(InvalidAccountId(id))
+        }
+    }
+}
+
+impl From<AccountId> for String {
+    fn from(id: AccountId) -> Self {
+        id.0
+    }
+}
+
+impl fmt::Display for AccountId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A conversation of a particular account. The same person or group in two
+/// accounts is two chats.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ChatRef {
+    pub account: AccountId,
+    pub conversation: ConversationId,
+}
+
+impl fmt::Display for ChatRef {
+    /// Stable string form used as notification id and GAction target.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.account, self.conversation)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid chat {0:?}")]
+pub struct InvalidChatRef(String);
+
+impl FromStr for ChatRef {
+    type Err = InvalidChatRef;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let invalid = || InvalidChatRef(s.to_owned());
+        // Account ids never contain '/', group ids may.
+        let (account, conversation) = s.split_once('/').ok_or_else(invalid)?;
+        Ok(Self {
+            account: AccountId::try_from(account.to_owned()).map_err(|_| invalid())?,
+            conversation: conversation.parse().map_err(|_| invalid())?,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Author {
     Me,
@@ -163,5 +244,36 @@ mod tests {
         }
         assert!("x:foo".parse::<ConversationId>().is_err());
         assert!("d:".parse::<ConversationId>().is_err());
+    }
+
+    #[test]
+    fn chat_ref_roundtrip() {
+        let account = |id: &str| AccountId::try_from(id.to_owned()).expect("valid account id");
+        for chat in [
+            ChatRef {
+                account: account("1"),
+                conversation: ConversationId::Direct(PeerId(
+                    "a1a1a1a1-0000-0000-0000-000000000001".into(),
+                )),
+            },
+            ChatRef {
+                account: account("work_2"),
+                conversation: ConversationId::Group("ab/c/d+==".into()),
+            },
+        ] {
+            let parsed: ChatRef = chat.to_string().parse().expect("valid chat must parse");
+            assert_eq!(parsed, chat);
+        }
+        assert!("d:peer".parse::<ChatRef>().is_err(), "account is required");
+        assert!("/d:peer".parse::<ChatRef>().is_err());
+        assert!("1/x:peer".parse::<ChatRef>().is_err());
+    }
+
+    #[test]
+    fn account_ids_are_path_and_css_safe() {
+        assert!(AccountId::try_from("12".to_owned()).is_ok());
+        for bad in ["", "a/b", "..", "a b", "ü"] {
+            assert!(AccountId::try_from(bad.to_owned()).is_err(), "{bad:?}");
+        }
     }
 }

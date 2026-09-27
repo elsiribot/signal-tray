@@ -5,6 +5,7 @@
 //! already running forwards the command to the running instance, which is
 //! how the global show/hide shortcut works (bind it in your compositor).
 
+mod accounts;
 mod app;
 mod config;
 mod demo;

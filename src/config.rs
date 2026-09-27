@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
+use crate::model::AccountId;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Corner {
@@ -101,6 +103,119 @@ impl From<Opacity> for f64 {
     }
 }
 
+/// An opaque colour, written as `#rrggbb`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("colour must be written as #rrggbb, got {0:?}")]
+pub struct InvalidColor(String);
+
+impl Color {
+    const BLACK: Self = Self::rgb(0, 0, 0);
+    const WHITE: Self = Self::rgb(0xff, 0xff, 0xff);
+
+    /// Handed out to new accounts in order, skipping colours in use. The
+    /// first one is the outgoing bubble colour of the single-account days.
+    pub const PALETTE: [Self; 8] = [
+        Self::rgb(0x2c, 0x6b, 0xed), // blue
+        Self::rgb(0xe8, 0x71, 0x0a), // orange
+        Self::rgb(0x2e, 0x9e, 0x5b), // green
+        Self::rgb(0x8e, 0x44, 0xad), // purple
+        Self::rgb(0xd9, 0x3b, 0x3b), // red
+        Self::rgb(0x0f, 0x9d, 0x9a), // teal
+        Self::rgb(0xd6, 0x42, 0x8f), // pink
+        Self::rgb(0x8d, 0x6e, 0x3f), // brown
+    ];
+
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    /// The first palette colour not in `used`, cycling once all are taken.
+    pub fn next_unused(used: &[Self]) -> Self {
+        Self::PALETTE
+            .into_iter()
+            .find(|color| !used.contains(color))
+            .unwrap_or(Self::PALETTE[used.len() % Self::PALETTE.len()])
+    }
+
+    /// WCAG relative luminance, 0 for black to 1 for white.
+    fn luminance(self) -> f64 {
+        let linear = |c: u8| {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(self.r) + 0.7152 * linear(self.g) + 0.0722 * linear(self.b)
+    }
+
+    /// Black or white, whichever reads on this background. Leans towards
+    /// white, which looks right on the saturated colours of the palette.
+    pub fn text_color(self) -> Self {
+        if self.luminance() > 0.5 {
+            Self::BLACK
+        } else {
+            Self::WHITE
+        }
+    }
+}
+
+impl std::fmt::Display for Color {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#{:02x}{:02x}{:02x}", self.r, self.g, self.b)
+    }
+}
+
+impl std::str::FromStr for Color {
+    type Err = InvalidColor;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let invalid = || InvalidColor(s.to_owned());
+        let hex = s.strip_prefix('#').ok_or_else(invalid)?;
+        if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(invalid());
+        }
+        let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| invalid());
+        Ok(Self::rgb(channel(0)?, channel(2)?, channel(4)?))
+    }
+}
+
+impl TryFrom<String> for Color {
+    type Error = InvalidColor;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<Color> for String {
+    fn from(color: Color) -> Self {
+        color.to_string()
+    }
+}
+
+/// A linked Signal account. Only accounts that finished linking are listed.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountConfig {
+    /// Names the account's data directory.
+    pub id: AccountId,
+    /// Shown next to the chat title; empty until linked, then the phone
+    /// number unless changed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    pub color: Color,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -121,6 +236,8 @@ pub struct Config {
     pub notifications: bool,
     /// Name shown in the phone's "Linked devices" list.
     pub device_name: String,
+    /// Last: TOML wants tables after plain keys.
+    pub accounts: Vec<AccountConfig>,
 }
 
 impl Default for Config {
@@ -138,6 +255,7 @@ impl Default for Config {
             hide_on_focus_loss: false,
             notifications: true,
             device_name: "signal-tray".to_owned(),
+            accounts: Vec::new(),
         }
     }
 }
@@ -152,13 +270,42 @@ impl Config {
     /// A missing file yields the defaults; a malformed one is an error so
     /// typos don't get silently ignored.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        match std::fs::read_to_string(path) {
+        let config = match std::fs::read_to_string(path) {
             Ok(text) => {
-                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+                Self::parse(&text).with_context(|| format!("parsing {}", path.display()))?
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        Ok(config)
+    }
+
+    fn parse(text: &str) -> anyhow::Result<Self> {
+        let config: Self = toml::from_str(text)?;
+        for (i, account) in config.accounts.iter().enumerate() {
+            if config.accounts[..i].iter().any(|a| a.id == account.id) {
+                anyhow::bail!("account id {:?} is listed twice", account.id.as_str());
+            }
         }
+        Ok(config)
+    }
+
+    pub fn account(&self, id: &AccountId) -> Option<&AccountConfig> {
+        self.accounts.iter().find(|a| &a.id == id)
+    }
+
+    pub fn account_mut(&mut self, id: &AccountId) -> Option<&mut AccountConfig> {
+        self.accounts.iter_mut().find(|a| &a.id == id)
+    }
+
+    /// Adds a linked account with the next free palette colour.
+    pub fn add_account(&mut self, id: AccountId) {
+        let used: Vec<Color> = self.accounts.iter().map(|a| a.color).collect();
+        self.accounts.push(AccountConfig {
+            id,
+            name: String::new(),
+            color: Color::next_unused(&used),
+        });
     }
 
     /// Writes the whole config, replacing the file atomically so a crash
@@ -264,5 +411,57 @@ mod tests {
     #[test]
     fn unknown_keys_are_rejected() {
         assert!(toml::from_str::<Config>("widht = 400\n").is_err());
+        assert!(
+            Config::parse("[[accounts]]\nid = \"1\"\ncolor = \"#000000\"\ncolour = 1\n").is_err()
+        );
+    }
+
+    #[test]
+    fn accounts_round_trip() {
+        let dir = std::env::temp_dir().join(format!("signal-tray-accounts-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mut config = Config::default();
+        config.add_account(AccountId::try_from("1".to_owned()).expect("valid id"));
+        config.add_account(AccountId::try_from("2".to_owned()).expect("valid id"));
+        config.accounts[1].name = "Work".to_owned();
+        config.save(&path).expect("config saves");
+        let loaded = Config::load(&path).expect("saved config loads");
+        assert_eq!(loaded.accounts, config.accounts);
+        assert_eq!(
+            loaded.accounts.iter().map(|a| a.color).collect::<Vec<_>>(),
+            Color::PALETTE[..2],
+            "new accounts get distinct palette colours"
+        );
+        std::fs::remove_dir_all(&dir).expect("temp dir is removable");
+    }
+
+    #[test]
+    fn duplicate_or_malformed_accounts_are_rejected() {
+        let account =
+            |id: &str, color: &str| format!("[[accounts]]\nid = {id:?}\ncolor = {color:?}\n");
+        assert!(Config::parse(&account("1", "#3A76f0")).is_ok());
+        assert!(Config::parse(&(account("1", "#000000") + &account("1", "#ffffff"))).is_err());
+        for color in ["3a76f0", "#3a76f", "#3a76f0ff", "#gggggg", "blue"] {
+            assert!(Config::parse(&account("1", color)).is_err(), "{color:?}");
+        }
+        assert!(Config::parse(&account("a/b", "#000000")).is_err());
+    }
+
+    #[test]
+    fn palette_skips_used_colours_and_cycles() {
+        assert_eq!(Color::next_unused(&[]), Color::PALETTE[0]);
+        assert_eq!(
+            Color::next_unused(&[Color::PALETTE[0], Color::PALETTE[2]]),
+            Color::PALETTE[1]
+        );
+        assert_eq!(Color::next_unused(&Color::PALETTE), Color::PALETTE[0]);
+    }
+
+    #[test]
+    fn text_colour_contrasts_with_background() {
+        assert_eq!(Color::PALETTE[0].text_color(), Color::WHITE);
+        assert_eq!(Color::rgb(0x11, 0x11, 0x11).text_color(), Color::WHITE);
+        assert_eq!(Color::rgb(0xf5, 0xc4, 0x00).text_color(), Color::BLACK);
+        assert_eq!(Color::WHITE.text_color(), Color::BLACK);
     }
 }

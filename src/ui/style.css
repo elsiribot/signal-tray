@@ -55,6 +55,11 @@ searchentry.search {
   padding: 4px 8px;
 }
 
+/* In the account's colour, see `account_css`. */
+.stripe {
+  min-width: 3px;
+}
+
 .conversation .name.unread {
   font-weight: bold;
 }
@@ -97,6 +102,10 @@ searchentry.search {
 .chat-title {
   font-weight: bold;
   margin-left: 2px;
+}
+
+.chat-account {
+  margin-left: 4px;
 }
 
 .messages {

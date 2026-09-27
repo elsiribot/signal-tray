@@ -13,6 +13,7 @@
 
 mod convert;
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -46,6 +47,8 @@ const THREAD_STACK_SIZE: usize = 64 * 1024 * 1024;
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 
 pub struct SpawnOptions {
+    /// Names the thread and tags its logs.
+    pub label: String,
     /// presage's SQLite store (keys, sessions, contacts, groups).
     pub store_path: PathBuf,
     /// Exists from linking until the history import has finished, so an
@@ -80,6 +83,8 @@ pub enum Event {
     LinkCode(String),
     /// The code expired or linking failed; [`Backend::retry_link`] starts over.
     LinkFailed(String),
+    /// The phone accepted the link; history and [`Event::Ready`] follow.
+    Linked,
     History(HistoryStatus),
     /// The account is usable; sending works from here on.
     Ready {
@@ -119,7 +124,8 @@ enum Command {
     },
 }
 
-/// Handle to the backend thread. Dropping it stops the backend.
+/// Handle to the backend thread. Dropping it stops the backend, and its
+/// event stream ends.
 pub struct Backend {
     commands: mpsc::UnboundedSender<Command>,
 }
@@ -129,9 +135,12 @@ impl Backend {
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = async_channel::unbounded();
         std::thread::Builder::new()
-            .name("signal".into())
+            .name(format!("signal-{}", opts.label))
             .stack_size(THREAD_STACK_SIZE)
             .spawn(move || {
+                // Everything on this thread belongs to the one account.
+                let span = tracing::info_span!("account", id = %opts.label);
+                let _entered = span.enter();
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -155,22 +164,30 @@ impl Backend {
         let _ = self.commands.send(Command::RetryLink);
     }
 
-    pub async fn send_text(
+    /// The returned future doesn't borrow the backend, which may be
+    /// dropped (its account removed) while the send is in flight.
+    pub fn send_text(
         &self,
         conversation: &ConversationId,
         text: &str,
         timestamp: Timestamp,
-    ) -> Result<(), SendError> {
+    ) -> impl Future<Output = Result<(), SendError>> + use<> {
         let (done, result) = oneshot::channel();
-        self.commands
+        let queued = self
+            .commands
             .send(Command::Send {
                 conversation: conversation.clone(),
                 text: text.to_owned(),
                 timestamp,
                 done,
             })
-            .map_err(|_| SendError::Offline)?;
-        result.await.map_err(|_| SendError::Offline)?
+            .is_ok();
+        async move {
+            if !queued {
+                return Err(SendError::Offline);
+            }
+            result.await.map_err(|_| SendError::Offline)?
+        }
     }
 
     /// Fire and forget: failures are logged by the backend.
@@ -201,8 +218,12 @@ async fn run(opts: SpawnOptions, events: Events, mut commands: Commands) -> anyh
     let mut manager = match Manager::load_registered(store.clone()).await {
         Ok(manager) => manager,
         Err(presage::Error::NotYetRegisteredError) => {
-            let manager = link(store.clone(), &opts, &events, &mut commands).await?;
+            let Some(manager) = link(store.clone(), &opts, &events, &mut commands).await? else {
+                tracing::info!("linking cancelled");
+                return Ok(());
+            };
             std::fs::write(&opts.history_marker, b"")?;
+            emit(&events, Event::Linked).await?;
             manager
         }
         Err(err) => return Err(err.into()),
@@ -243,13 +264,14 @@ fn mention_names(names: &[(ConversationId, String)]) -> Names {
         .collect()
 }
 
-/// Shows QR codes until the phone links us.
+/// Shows QR codes until the phone links us. Returns `None` if the app
+/// dropped the backend, i.e. cancelled linking.
 async fn link(
     store: SqliteStore,
     opts: &SpawnOptions,
     events: &Events,
     commands: &mut Commands,
-) -> anyhow::Result<Manager<SqliteStore, Registered>> {
+) -> anyhow::Result<Option<Manager<SqliteStore, Registered>>> {
     loop {
         let (url_tx, url_rx) = futures::channel::oneshot::channel::<url::Url>();
         let show_code = async {
@@ -257,7 +279,7 @@ async fn link(
                 let _ = emit(events, Event::LinkCode(url.to_string())).await;
             }
         };
-        let (result, ()) = future::join(
+        let linking = future::join(
             Manager::link_secondary_device(
                 store.clone(),
                 SignalServers::Production,
@@ -265,10 +287,19 @@ async fn link(
                 url_tx,
             ),
             show_code,
-        )
-        .await;
+        );
+        pin_mut!(linking);
+        let result = loop {
+            tokio::select! {
+                (result, ()) = &mut linking => break result,
+                command = commands.recv() => match command {
+                    None => return Ok(None),
+                    Some(command) => reject_while_linking(command),
+                },
+            }
+        };
         let err = match result {
-            Ok(manager) => return Ok(manager),
+            Ok(manager) => return Ok(Some(manager)),
             Err(err) => err,
         };
         tracing::warn!(%err, "linking did not complete");
@@ -276,14 +307,20 @@ async fn link(
         // Nothing else can be done until the user asks for a new code.
         loop {
             match commands.recv().await {
-                None => anyhow::bail!("the app went away"),
+                None => return Ok(None),
                 Some(Command::RetryLink) => break,
-                Some(Command::Send { done, .. }) => {
-                    let _ = done.send(Err(SendError::Offline));
-                }
-                Some(Command::ReadReceipts { .. }) => {}
+                Some(command) => reject_while_linking(command),
             }
         }
+    }
+}
+
+fn reject_while_linking(command: Command) {
+    match command {
+        Command::Send { done, .. } => {
+            let _ = done.send(Err(SendError::Offline));
+        }
+        Command::RetryLink | Command::ReadReceipts { .. } => {}
     }
 }
 

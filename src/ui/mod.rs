@@ -7,14 +7,15 @@ mod placement;
 pub mod settings;
 
 use std::cell::{Cell, RefCell};
+use std::fmt::Write as _;
 use std::rc::Rc;
 
 use gtk::prelude::*;
 use gtk::{gdk, glib, pango};
 use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell as _};
 
-use crate::config::{Config, Opacity};
-use crate::model::{ConversationId, DeliveryStatus, Timestamp};
+use crate::config::{Color, Config, Opacity};
+use crate::model::{AccountId, ChatRef, DeliveryStatus, Timestamp};
 use crate::store::ConversationSummary;
 pub use placement::Placement;
 
@@ -34,17 +35,19 @@ const BOTTOM_SLACK: f64 = 8.0;
 const FOCUS_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
 
 pub enum UiEvent {
-    Open(ConversationId),
+    Open(ChatRef),
     /// The open conversation is on screen and focused, so its messages
     /// count as read.
-    Seen(ConversationId),
+    Seen(ChatRef),
     Send {
-        conversation: ConversationId,
+        chat: ChatRef,
         text: String,
     },
     /// The window was brought up.
     Shown,
     RetryLink,
+    /// Escape on the link page.
+    CancelLink,
     OpenSettings,
     /// The window was dragged to a new spot.
     Moved(Placement),
@@ -60,9 +63,34 @@ impl UiEvent {
             Self::Send { .. } => "send",
             Self::Shown => "shown",
             Self::RetryLink => "retry-link",
+            Self::CancelLink => "cancel-link",
             Self::OpenSettings => "open-settings",
             Self::Moved(_) => "moved",
             Self::Quit => "quit",
+        }
+    }
+}
+
+/// How an account is presented.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountView {
+    pub id: AccountId,
+    pub name: String,
+    pub color: Color,
+}
+
+/// A row of the unified chat list.
+#[derive(Clone, Debug)]
+pub struct ListedChat {
+    pub account: AccountId,
+    pub summary: ConversationSummary,
+}
+
+impl ListedChat {
+    fn chat(&self) -> ChatRef {
+        ChatRef {
+            account: self.account.clone(),
+            conversation: self.summary.id.clone(),
         }
     }
 }
@@ -129,10 +157,11 @@ impl Page {
 
 #[derive(Default)]
 struct State {
-    conversations: Vec<ConversationSummary>,
-    /// Conversation of each row in the chat list, in display order.
-    visible: Vec<ConversationId>,
-    current: Option<ConversationId>,
+    accounts: Vec<AccountView>,
+    conversations: Vec<ListedChat>,
+    /// Chat of each row in the chat list, in display order.
+    visible: Vec<ChatRef>,
+    current: Option<ChatRef>,
     /// Where F1/Escape returns to from the help page.
     page_before_help: Option<Page>,
     link_expired: bool,
@@ -148,6 +177,8 @@ pub struct Ui {
     window: gtk::ApplicationWindow,
     /// Holds the one rule that depends on the configured opacity.
     opacity_css: gtk::CssProvider,
+    /// Holds the rules for account colours.
+    account_css: gtk::CssProvider,
     uses_layer_shell: bool,
     hide_on_focus_loss: Cell<bool>,
     stack: gtk::Stack,
@@ -155,13 +186,16 @@ pub struct Ui {
     banner_revealer: gtk::Revealer,
     status_label: gtk::Label,
     status_spinner: gtk::Spinner,
+    link_title: gtk::Label,
     link_picture: gtk::Picture,
     link_hint: gtk::Label,
     search: gtk::SearchEntry,
     list_box: gtk::ListBox,
     list_scroll: gtk::ScrolledWindow,
     list_empty: gtk::Label,
+    chat_header: gtk::Box,
     chat_title: gtk::Label,
+    chat_account: gtk::Label,
     messages: gtk::ListBox,
     messages_scroll: gtk::ScrolledWindow,
     compose: gtk::TextView,
@@ -180,6 +214,8 @@ impl Ui {
         load_css();
         let opacity_css = gtk::CssProvider::new();
         add_css_provider(&opacity_css);
+        let account_css = gtk::CssProvider::new();
+        add_css_provider(&account_css);
 
         let window = gtk::ApplicationWindow::builder()
             .application(app)
@@ -230,12 +266,8 @@ impl Ui {
         let link_page = vbox(8);
         link_page.set_valign(gtk::Align::Center);
         link_page.add_css_class("page");
-        link_page.append(
-            &gtk::Label::builder()
-                .label("Link with your phone")
-                .css_classes(["title"])
-                .build(),
-        );
+        let link_title = gtk::Label::builder().css_classes(["title"]).build();
+        link_page.append(&link_title);
         link_page.append(&link_picture);
         link_page.append(
             &gtk::Label::builder()
@@ -283,13 +315,19 @@ impl Ui {
             .build();
         let chat_title = gtk::Label::builder()
             .xalign(0.0)
-            .hexpand(true)
             .ellipsize(pango::EllipsizeMode::End)
             .css_classes(["chat-title"])
+            .build();
+        let chat_account = gtk::Label::builder()
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(pango::EllipsizeMode::End)
+            .css_classes(["chat-account", "dim"])
             .build();
         let header = gtk::Box::builder().css_classes(["chat-header"]).build();
         header.append(&back);
         header.append(&chat_title);
+        header.append(&chat_account);
 
         let messages = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
@@ -359,6 +397,7 @@ impl Ui {
         let ui = Rc::new(Self {
             window,
             opacity_css,
+            account_css,
             uses_layer_shell,
             hide_on_focus_loss: Cell::new(config.hide_on_focus_loss),
             stack,
@@ -366,13 +405,16 @@ impl Ui {
             banner_revealer,
             status_label,
             status_spinner,
+            link_title,
             link_picture,
             link_hint,
             search,
             list_box,
             list_scroll,
             list_empty,
+            chat_header: header,
             chat_title,
+            chat_account,
             messages,
             messages_scroll,
             compose,
@@ -594,7 +636,9 @@ impl Ui {
         self.set_page(Page::Status);
     }
 
-    pub fn show_link(&self, uri: &str) {
+    /// Shows the QR code the phone scans to link an account.
+    pub fn show_link(&self, uri: &str, title: &str) {
+        self.link_title.set_label(title);
         match qr_texture(uri) {
             Ok(texture) => self.link_picture.set_paintable(Some(&texture)),
             Err(err) => {
@@ -681,8 +725,25 @@ impl Ui {
 
     // ---- chat list ---------------------------------------------------------
 
-    /// Replaces the known conversations and refreshes the list.
-    pub fn set_conversations(&self, conversations: Vec<ConversationSummary>) {
+    /// Replaces the accounts and their colours. With a single account,
+    /// chats aren't marked with it.
+    pub fn set_accounts(&self, accounts: Vec<AccountView>) {
+        self.account_css.load_from_string(&account_css(&accounts));
+        self.state.borrow_mut().accounts = accounts;
+        self.rebuild_list();
+        let current = self.state.borrow().current.clone();
+        if let Some(current) = current {
+            self.update_chat_title(&current);
+        }
+    }
+
+    fn several_accounts(&self) -> bool {
+        self.state.borrow().accounts.len() > 1
+    }
+
+    /// Replaces the chats of all accounts, in display order, and refreshes
+    /// the list.
+    pub fn set_conversations(&self, conversations: Vec<ListedChat>) {
         self.state.borrow_mut().conversations = conversations;
         self.rebuild_list();
         let current = self.state.borrow().current.clone();
@@ -701,21 +762,22 @@ impl Ui {
                 .cloned()
         });
 
+        let several_accounts = self.several_accounts();
         let mut state = self.state.borrow_mut();
-        // Right after linking there is no history (signal-cli can't import
-        // it), so list everyone rather than show an empty window.
+        // Right after linking without history there are no chats yet, so
+        // list everyone rather than show an empty window.
         let any_activity = state
             .conversations
             .iter()
-            .any(|c| c.last_activity.is_some());
-        let matches: Vec<&ConversationSummary> = state
+            .any(|c| c.summary.last_activity.is_some());
+        let matches: Vec<&ListedChat> = state
             .conversations
             .iter()
             .filter(|c| {
                 if filter.is_empty() {
-                    c.last_activity.is_some() || !any_activity
+                    c.summary.last_activity.is_some() || !any_activity
                 } else {
-                    c.name.to_lowercase().contains(&filter)
+                    c.summary.name.to_lowercase().contains(&filter)
                 }
             })
             .take(if filter.is_empty() {
@@ -727,9 +789,10 @@ impl Ui {
 
         self.list_box.remove_all();
         for conversation in &matches {
-            self.list_box.append(&conversation_row(conversation));
+            self.list_box
+                .append(&conversation_row(conversation, several_accounts));
         }
-        let visible: Vec<ConversationId> = matches.iter().map(|c| c.id.clone()).collect();
+        let visible: Vec<ChatRef> = matches.iter().map(|c| c.chat()).collect();
         // A background refresh must not move the selection under the
         // user's fingers; a new search starts at the best match.
         let select_index = selected_id
@@ -825,13 +888,13 @@ impl Ui {
     }
 
     /// Whether the user is currently looking at this conversation.
-    pub fn is_viewing(&self, id: &ConversationId) -> bool {
+    pub fn is_viewing(&self, id: &ChatRef) -> bool {
         self.is_focused()
             && self.page() == Some(Page::Chat)
             && self.state.borrow().current.as_ref() == Some(id)
     }
 
-    pub fn current_conversation(&self) -> Option<ConversationId> {
+    pub fn current_chat(&self) -> Option<ChatRef> {
         self.state.borrow().current.clone()
     }
 
@@ -839,24 +902,32 @@ impl Ui {
         if self.page() != Some(Page::Chat) {
             return;
         }
-        if let Some(current) = self.current_conversation() {
+        if let Some(current) = self.current_chat() {
             self.emit(UiEvent::Seen(current));
         }
     }
 
-    fn update_chat_title(&self, id: &ConversationId) {
-        let name = self
-            .state
-            .borrow()
+    fn update_chat_title(&self, id: &ChatRef) {
+        let state = self.state.borrow();
+        let name = state
             .conversations
             .iter()
-            .find(|c| &c.id == id)
-            .map(|c| c.name.clone());
+            .find(|c| c.account == id.account && c.summary.id == id.conversation)
+            .map(|c| c.summary.name.clone());
         self.chat_title
-            .set_label(&name.unwrap_or_else(|| id.to_string()));
+            .set_label(&name.unwrap_or_else(|| id.conversation.to_string()));
+        let account = state
+            .accounts
+            .iter()
+            .find(|a| a.id == id.account)
+            .filter(|_| state.accounts.len() > 1);
+        self.chat_account
+            .set_label(&account.map(|a| format!("· {}", a.name)).unwrap_or_default());
+        self.chat_header
+            .set_css_classes(&["chat-header", &account_class(&id.account)]);
     }
 
-    pub fn show_chat(&self, id: &ConversationId, messages: &[MessageView]) {
+    pub fn show_chat(&self, id: &ChatRef, messages: &[MessageView]) {
         let switching = self.state.borrow().current.as_ref() != Some(id);
         if switching {
             self.compose.buffer().set_text("");
@@ -885,7 +956,7 @@ impl Ui {
 
     /// Re-renders the open conversation if it is `id`, keeping the scroll
     /// position unless the view is pinned to the newest message.
-    pub fn refresh_chat(&self, id: &ConversationId, messages: &[MessageView]) {
+    pub fn refresh_chat(&self, id: &ChatRef, messages: &[MessageView]) {
         let mut state = self.state.borrow_mut();
         if state.current.as_ref() != Some(id) {
             return;
@@ -899,6 +970,9 @@ impl Ui {
 
     fn render_messages(&self, messages: &[MessageView]) {
         self.messages.remove_all();
+        let Some(account) = self.current_chat().map(|c| c.account) else {
+            return;
+        };
         let mut last_day = None;
         for message in messages {
             let day = format::day_key(message.timestamp);
@@ -906,24 +980,25 @@ impl Ui {
                 last_day = day;
                 self.messages.append(&day_separator(message.timestamp));
             }
-            self.messages.append(&message_row(message));
+            self.messages.append(&message_row(message, &account));
         }
     }
 
-    fn append_pending(&self, text: &str) {
+    fn append_pending(&self, account: &AccountId, text: &str) {
         self.state.borrow_mut().stick_to_bottom = true;
-        self.messages.append(&message_row(&MessageView {
+        let view = MessageView {
             status: MessageStatus::Pending,
             sender: None,
             body: text.to_owned(),
             timestamp: Timestamp(glib::real_time() / 1000),
             edited: false,
             deleted: false,
-        }));
+        };
+        self.messages.append(&message_row(&view, account));
     }
 
     /// Puts the text of a failed send back into the compose box.
-    pub fn restore_draft(&self, id: &ConversationId, text: &str) {
+    pub fn restore_draft(&self, id: &ChatRef, text: &str) {
         let buffer = self.compose.buffer();
         if self.state.borrow().current.as_ref() == Some(id) && buffer.char_count() == 0 {
             buffer.set_text(text);
@@ -931,7 +1006,7 @@ impl Ui {
     }
 
     fn send_compose(&self) {
-        let Some(conversation) = self.current_conversation() else {
+        let Some(chat) = self.current_chat() else {
             return;
         };
         let buffer = self.compose.buffer();
@@ -940,9 +1015,9 @@ impl Ui {
         if text.is_empty() {
             return;
         }
-        self.append_pending(text);
+        self.append_pending(&chat.account, text);
         self.emit(UiEvent::Send {
-            conversation,
+            chat,
             text: text.to_owned(),
         });
         buffer.set_text("");
@@ -986,6 +1061,10 @@ impl Ui {
             }
             (gdk::Key::Left, Some(Page::Chat)) if alt => {
                 self.show_list();
+                true
+            }
+            (gdk::Key::Escape, Some(Page::Link)) => {
+                self.emit(UiEvent::CancelLink);
                 true
             }
             (gdk::Key::Escape, Some(Page::List)) if !self.search.text().is_empty() => {
@@ -1110,7 +1189,35 @@ fn label(text: &str, classes: &[&str]) -> gtk::Label {
     label
 }
 
-fn conversation_row(conversation: &ConversationSummary) -> gtk::ListBoxRow {
+fn account_class(account: &AccountId) -> String {
+    format!("acct-{account}")
+}
+
+/// Colours outgoing bubbles, and with several accounts, the stripe of
+/// list rows and the chat header's underline. Generated rather than using
+/// CSS variables, which need GTK 4.16.
+fn account_css(accounts: &[AccountView]) -> String {
+    let mut css = String::new();
+    for account in accounts {
+        let (class, color) = (account_class(&account.id), account.color);
+        let _ = writeln!(
+            css,
+            ".bubble.outgoing.{class} {{ background: {color}; color: {}; }}",
+            color.text_color()
+        );
+        if accounts.len() > 1 {
+            let _ = writeln!(css, ".{class} > .stripe {{ background: {color}; }}");
+            let _ = writeln!(
+                css,
+                ".chat-header.{class} {{ border-bottom: 2px solid {color}; }}"
+            );
+        }
+    }
+    css
+}
+
+fn conversation_row(chat: &ListedChat, show_account: bool) -> gtk::ListBoxRow {
+    let conversation = &chat.summary;
     let name = label(&conversation.name, &["name"]);
     name.set_ellipsize(pango::EllipsizeMode::End);
     name.set_hexpand(true);
@@ -1144,6 +1251,7 @@ fn conversation_row(conversation: &ConversationSummary) -> gtk::ListBoxRow {
 
     let content = vbox(0);
     content.add_css_class("conversation");
+    content.set_hexpand(true);
     content.append(&top);
     // Contacts without messages get a single line.
     if conversation
@@ -1154,7 +1262,13 @@ fn conversation_row(conversation: &ConversationSummary) -> gtk::ListBoxRow {
     {
         content.append(&bottom);
     }
-    gtk::ListBoxRow::builder().child(&content).build()
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.add_css_class(&account_class(&chat.account));
+    if show_account {
+        row.append(&gtk::Box::builder().css_classes(["stripe"]).build());
+    }
+    row.append(&content);
+    gtk::ListBoxRow::builder().child(&row).build()
 }
 
 fn day_separator(ts: Timestamp) -> gtk::ListBoxRow {
@@ -1169,11 +1283,12 @@ fn day_separator(ts: Timestamp) -> gtk::ListBoxRow {
         .build()
 }
 
-fn message_row(message: &MessageView) -> gtk::ListBoxRow {
+fn message_row(message: &MessageView, account: &AccountId) -> gtk::ListBoxRow {
     let outgoing = !matches!(message.status, MessageStatus::Incoming);
     let bubble = vbox(0);
     bubble.add_css_class("bubble");
     bubble.add_css_class(if outgoing { "outgoing" } else { "incoming" });
+    bubble.add_css_class(&account_class(account));
     bubble.set_halign(if outgoing {
         gtk::Align::End
     } else {
