@@ -89,6 +89,44 @@ searchentry.search {
   color: white;
 }
 
+/* pictures, see ui/avatar.rs */
+
+.avatar.thumbnail,
+.avatar-initials {
+  border-radius: 50%;
+}
+
+.avatar-initials {
+  color: white;
+  font-weight: bold;
+  font-size: 0.75em;
+}
+
+.avatar-c0 { background: #c9463d; }
+.avatar-c1 { background: #b35a12; }
+.avatar-c2 { background: #8a6d00; }
+.avatar-c3 { background: #3b8043; }
+.avatar-c4 { background: #16797f; }
+.avatar-c5 { background: #2c6bed; }
+.avatar-c6 { background: #6b4fc7; }
+.avatar-c7 { background: #a8407a; }
+
+.list-avatar {
+  margin-left: 8px;
+}
+
+.header-avatar {
+  margin: 0 4px 0 2px;
+}
+
+.sender-avatar {
+  margin: 2px 0 0 8px;
+}
+
+.from-sender > .bubble {
+  margin-left: 4px;
+}
+
 /* chat */
 
 .chat-header {

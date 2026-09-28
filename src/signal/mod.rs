@@ -29,7 +29,7 @@ use presage::manager::Registered;
 use presage::model::identity::OnNewIdentity;
 use presage::model::messages::Received;
 use presage::proto::receipt_message::Type as ReceiptType;
-use presage::proto::{AttachmentPointer, DataMessage, ReceiptMessage};
+use presage::proto::{AttachmentPointer, DataMessage, GroupContextV2, ReceiptMessage};
 use presage::store::{ContentsStore as _, Thread};
 use presage_store_sqlite::SqliteStore;
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -138,6 +138,11 @@ enum Command {
         dest: PathBuf,
         done: oneshot::Sender<Result<(), DownloadError>>,
     },
+    FetchAvatar {
+        conversation: ConversationId,
+        dest: PathBuf,
+        done: oneshot::Sender<Result<bool, DownloadError>>,
+    },
     ReadReceipts {
         sender: PeerId,
         timestamps: Vec<Timestamp>,
@@ -237,6 +242,30 @@ impl Backend {
                 return Err(DownloadError::Offline);
             }
             // Commands are dropped, not answered, while offline.
+            result.await.map_err(|_| DownloadError::Offline)?
+        }
+    }
+
+    /// Saves the picture of a contact or group to `dest`. Resolves to
+    /// whether there is one. Fails while offline.
+    pub fn fetch_avatar(
+        &self,
+        conversation: &ConversationId,
+        dest: PathBuf,
+    ) -> impl Future<Output = Result<bool, DownloadError>> + use<> {
+        let (done, result) = oneshot::channel();
+        let queued = self
+            .commands
+            .send(Command::FetchAvatar {
+                conversation: conversation.clone(),
+                dest,
+                done,
+            })
+            .is_ok();
+        async move {
+            if !queued {
+                return Err(DownloadError::Offline);
+            }
             result.await.map_err(|_| DownloadError::Offline)?
         }
     }
@@ -372,6 +401,9 @@ fn reject_while_linking(command: Command) {
             let _ = done.send(Err(SendError::Offline));
         }
         Command::Download { done, .. } => {
+            let _ = done.send(Err(DownloadError::Offline));
+        }
+        Command::FetchAvatar { done, .. } => {
             let _ = done.send(Err(DownloadError::Offline));
         }
         Command::RetryLink | Command::ReadReceipts { .. } => {}
@@ -604,6 +636,9 @@ async fn receive_loop(
                     Some(Command::Download { done, .. }) => {
                         let _ = done.send(Err(DownloadError::Offline));
                     }
+                    Some(Command::FetchAvatar { done, .. }) => {
+                        let _ = done.send(Err(DownloadError::Offline));
+                    }
                     Some(_) => {}
                     None => return Ok(()),
                 },
@@ -692,6 +727,23 @@ fn handle_command(
                 let _ = done.send(result);
             });
         }
+        Command::FetchAvatar {
+            conversation,
+            dest,
+            done,
+        } => {
+            let downloads = downloads.clone();
+            tokio::task::spawn_local(async move {
+                let result = match downloads.acquire().await {
+                    Ok(_permit) => fetch_avatar(&mut manager, &conversation, &dest).await,
+                    Err(_) => Err(DownloadError::Offline),
+                };
+                if let Err(err) = &result {
+                    tracing::warn!(%err, %conversation, "fetching a picture failed");
+                }
+                let _ = done.send(result);
+            });
+        }
         Command::ReadReceipts { sender, timestamps } => {
             tokio::task::spawn_local(async move {
                 let Some(recipient) = service_id(&sender) else {
@@ -771,7 +823,6 @@ async fn upload(
         .collect()
 }
 
-/// Writes through a temporary file, so `dest` is either complete or absent.
 async fn download(
     manager: &Manager<SqliteStore, Registered>,
     pointer: &[u8],
@@ -783,10 +834,65 @@ async fn download(
         .get_attachment(&pointer)
         .await
         .map_err(|err| DownloadError::Signal(err.to_string()))?;
+    write_file(dest, &data)?;
+    Ok(())
+}
+
+/// Returns whether the contact or group has a picture.
+async fn fetch_avatar(
+    manager: &mut Manager<SqliteStore, Registered>,
+    conversation: &ConversationId,
+    dest: &Path,
+) -> Result<bool, DownloadError> {
+    let signal = |err: presage::Error<_>| DownloadError::Signal(err.to_string());
+    let avatar = match conversation {
+        ConversationId::Direct(peer) => {
+            // Profiles are looked up by ACI; PNI-only contacts have none.
+            let Some(ServiceId::Aci(aci)) = service_id(peer) else {
+                return Ok(false);
+            };
+            let key = manager
+                .store()
+                .profile_key(&ServiceId::Aci(aci))
+                .await
+                .map_err(|err| DownloadError::Signal(err.to_string()))?;
+            let Some(key) = key else {
+                return Ok(false);
+            };
+            manager
+                .retrieve_profile_avatar_by_uuid(Uuid::from(aci), key)
+                .await
+                .map_err(signal)?
+        }
+        ConversationId::Group(key) => {
+            let master_key = group_master_key(key)
+                .ok_or_else(|| DownloadError::Signal("invalid group".to_owned()))?;
+            // Revision 0: the locally known group is recent enough.
+            let context = GroupContextV2 {
+                master_key: Some(master_key.to_vec()),
+                revision: Some(0),
+                ..Default::default()
+            };
+            manager
+                .retrieve_group_avatar(context)
+                .await
+                .map_err(signal)?
+        }
+    };
+    match avatar.filter(|bytes| !bytes.is_empty()) {
+        Some(bytes) => {
+            write_file(dest, &bytes)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Writes through a temporary file, so `dest` is either complete or absent.
+fn write_file(dest: &Path, data: &[u8]) -> std::io::Result<()> {
     let partial = dest.with_extension("part");
     std::fs::write(&partial, data)?;
-    std::fs::rename(&partial, dest)?;
-    Ok(())
+    std::fs::rename(&partial, dest)
 }
 
 fn now_ms() -> i64 {

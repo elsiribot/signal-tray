@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS attachments (
     file         TEXT,
     UNIQUE (message_id, idx)
 );
+-- Pictures of contacts and groups.
+CREATE TABLE IF NOT EXISTS avatars (
+    -- ConversationId string form
+    subject      TEXT PRIMARY KEY,
+    -- name in the account's avatars directory, NULL for no picture
+    file         TEXT,
+    -- ms since epoch
+    fetched_at   INTEGER NOT NULL
+);
 ";
 
 /// Columns added to `attachments` after it was introduced, with their
@@ -124,6 +133,14 @@ pub struct MissingAttachment {
     pub id: AttachmentId,
     pub content_type: String,
     pub pointer: Vec<u8>,
+}
+
+/// The picture of a contact or group, as last fetched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredAvatar {
+    /// Name in the avatars directory; `None` if there's no picture.
+    pub file: Option<String>,
+    pub fetched_at: Timestamp,
 }
 
 /// What [`Store::purge_expired`] removed.
@@ -672,6 +689,53 @@ impl Store {
             attachments.entry(message_id).or_default().push(attachment);
         }
         Ok(attachments)
+    }
+
+    /// The pictures of contacts and groups, as last fetched.
+    pub fn avatars(&self) -> anyhow::Result<HashMap<ConversationId, StoredAvatar>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT subject, file, fetched_at FROM avatars")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                StoredAvatar {
+                    file: row.get(1)?,
+                    fetched_at: Timestamp(row.get(2)?),
+                },
+            ))
+        })?;
+        rows.map(|row| {
+            let (subject, avatar) = row?;
+            Ok((subject.parse()?, avatar))
+        })
+        .collect()
+    }
+
+    /// Records a fetched picture. Returns the file it replaces, to delete.
+    pub fn set_avatar(
+        &mut self,
+        subject: &ConversationId,
+        avatar: &StoredAvatar,
+    ) -> anyhow::Result<Option<String>> {
+        let tx = self.conn.transaction()?;
+        let subject = subject.to_string();
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT file FROM avatars WHERE subject = ?1",
+                params![subject],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        tx.execute(
+            "INSERT INTO avatars (subject, file, fetched_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT (subject) DO UPDATE SET
+                 file = excluded.file, fetched_at = excluded.fetched_at",
+            params![subject, avatar.file, avatar.fetched_at.0],
+        )?;
+        tx.commit()?;
+        Ok(previous.filter(|p| Some(p) != avatar.file.as_ref()))
     }
 
     pub fn total_unread(&self) -> anyhow::Result<u32> {
@@ -1225,6 +1289,43 @@ mod tests {
             .expect("new columns");
         assert_eq!((kind.as_str(), played), ("image", true));
         drop(store);
+    }
+
+    #[test]
+    fn avatars_are_replaced_and_hand_back_the_old_file() {
+        let mut store = Store::open_in_memory().expect("in-memory db");
+        let alice = ConversationId::Direct(peer("alice"));
+        let group = ConversationId::Group("ab/c+=".into());
+        let avatar = |file: Option<&str>, at| StoredAvatar {
+            file: file.map(str::to_owned),
+            fetched_at: Timestamp(at),
+        };
+        assert_eq!(
+            store
+                .set_avatar(&alice, &avatar(Some("a-1.img"), 1))
+                .expect("set"),
+            None
+        );
+        assert_eq!(
+            store.set_avatar(&group, &avatar(None, 1)).expect("set"),
+            None
+        );
+        assert_eq!(
+            store
+                .set_avatar(&alice, &avatar(Some("a-2.img"), 2))
+                .expect("set"),
+            Some("a-1.img".to_owned())
+        );
+        assert_eq!(
+            store
+                .set_avatar(&alice, &avatar(Some("a-2.img"), 3))
+                .expect("set"),
+            None,
+            "the same file isn't handed back"
+        );
+        let avatars = store.avatars().expect("avatars");
+        assert_eq!(avatars[&alice], avatar(Some("a-2.img"), 3));
+        assert_eq!(avatars[&group], avatar(None, 1));
     }
 
     #[test]

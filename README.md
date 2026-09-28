@@ -4,7 +4,9 @@ A small Signal client that sits in a corner of your screen and hides in the
 tray. It's built to pop up, answer a message, and get out of the way without
 touching the mouse.
 
-- Chat list → chat, like on mobile. Compact rows, no avatars.
+- Chat list → chat, like on mobile. Compact rows with small profile
+  pictures (initials when there's none), also next to senders in groups
+  and in notifications.
 - Keyboard first: search, move, open, reply, and switch chats from the
   keyboard.
 - Floats bottom-right via `wlr-layer-shell` (sway, Hyprland, river, KDE, …).
@@ -174,6 +176,8 @@ with:
   there's one long-lived copy of each message.
 - `attachments/`: received and sent images, and received audio. They're
   deleted along with their message (remote deletes, disappearing messages).
+- `avatars/`: pictures of contacts and groups, checked for changes at most
+  once a day.
 
 Versions before multi-account support kept both files directly in
 `~/.local/share/signal-tray/`; they're moved into `accounts/1/` on the first

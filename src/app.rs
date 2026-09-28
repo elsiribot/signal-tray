@@ -21,16 +21,21 @@ use crate::model::{
     PeerId, SignalEvent, Timestamp,
 };
 use crate::signal::{self, Backend, Connection, Event, HistoryStatus, Origin, SendError};
-use crate::store::{AttachmentId, ConversationSummary, MissingAttachment, ReadState, Store};
+use crate::store::{
+    AttachmentId, ConversationSummary, MissingAttachment, ReadState, Store, StoredAvatar,
+};
 use crate::tray::{self, TrayAction, TrayHandle};
 use crate::ui::settings::{Setting, Settings};
 use crate::ui::{
-    AccountView, AudioState, AudioView, ImageState, ImageView, LinkState, ListedChat,
+    AccountView, AudioState, AudioView, AvatarView, ImageState, ImageView, LinkState, ListedChat,
     MessageStatus, MessageView, StagedImage, Status, Ui, UiEvent,
 };
 
 /// How often disappearing messages are checked for expiry.
 const PURGE_INTERVAL: Duration = Duration::from_secs(30);
+/// How long a fetched picture is used before checking for a new one.
+/// Every check is a request to Signal.
+const AVATAR_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub const OPEN_CONVERSATION_ACTION: &str = "open-conversation";
 
@@ -51,6 +56,13 @@ struct Account {
     downloading: RefCell<HashSet<AttachmentId>>,
     /// Images whose download failed; retried when their chat is opened.
     failed: RefCell<HashSet<AttachmentId>>,
+    /// Where pictures of contacts and groups are saved.
+    avatars_dir: PathBuf,
+    /// The pictures as last fetched, as in the store.
+    avatars: RefCell<HashMap<ConversationId, StoredAvatar>>,
+    /// Pictures being fetched, or whose fetch failed; those are retried on
+    /// the next start.
+    avatars_fetching: RefCell<HashSet<ConversationId>>,
     /// `None` in demo mode. Taken when the account is removed, which stops
     /// the backend and ends its event loop.
     backend: RefCell<Option<Backend>>,
@@ -68,14 +80,22 @@ impl Account {
         id: AccountId,
         store: Store,
         attachments: PathBuf,
+        avatars_dir: PathBuf,
         backend: Option<Backend>,
     ) -> Rc<Self> {
+        let avatars = store.avatars().unwrap_or_else(|err| {
+            tracing::error!(%err, account = %id, "loading pictures failed");
+            HashMap::new()
+        });
         Rc::new(Self {
             id,
             store: RefCell::new(store),
             attachments,
             downloading: RefCell::default(),
             failed: RefCell::default(),
+            avatars_dir,
+            avatars: RefCell::new(avatars),
+            avatars_fetching: RefCell::default(),
             backend: RefCell::new(backend),
             number: RefCell::default(),
             ready: Cell::default(),
@@ -91,17 +111,35 @@ impl Account {
         }
     }
 
-    /// Deletes images whose messages are gone.
+    /// Deletes attachments whose messages are gone.
     fn remove_files(&self, files: Vec<String>) {
         for file in files {
-            let path = self.attachments.join(file);
-            if let Err(err) = std::fs::remove_file(&path)
-                && err.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(%err, path = %path.display(), "deleting an image failed");
-            }
+            remove_file(&self.attachments.join(file));
         }
     }
+
+    fn avatar(&self, subject: &ConversationId) -> Option<PathBuf> {
+        let avatars = self.avatars.borrow();
+        let file = avatars.get(subject)?.file.as_ref()?;
+        Some(self.avatars_dir.join(file))
+    }
+}
+
+fn remove_file(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(%err, path = %path.display(), "deleting a file failed");
+    }
+}
+
+/// A new name for each fetch of a picture, so cached copies of an older
+/// one are never shown for it.
+fn avatar_file(subject: &ConversationId, fetched_at: Timestamp) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    subject.hash(&mut hasher);
+    format!("{:016x}-{fetched_at}.img", hasher.finish())
 }
 
 /// Name of an image in the attachments directory.
@@ -117,6 +155,7 @@ fn open_account(
 ) -> anyhow::Result<(Rc<Account>, async_channel::Receiver<Event>)> {
     let paths = accounts::paths(data_dir, id);
     std::fs::create_dir_all(&paths.attachments)?;
+    std::fs::create_dir_all(&paths.avatars)?;
     let store = Store::open(&paths.messages)?;
     let (backend, events) = Backend::spawn(signal::SpawnOptions {
         label: id.to_string(),
@@ -125,7 +164,13 @@ fn open_account(
         device_name: device_name.to_owned(),
     })?;
     Ok((
-        Account::new(id.clone(), store, paths.attachments, Some(backend)),
+        Account::new(
+            id.clone(),
+            store,
+            paths.attachments,
+            paths.avatars,
+            Some(backend),
+        ),
         events,
     ))
 }
@@ -192,7 +237,9 @@ impl Controller {
             Mode::Demo => {
                 config.accounts.clear();
                 for (account_config, store, attachments) in crate::demo::accounts()? {
-                    let account = Account::new(account_config.id.clone(), store, attachments, None);
+                    let avatars = attachments.join("avatars");
+                    let account =
+                        Account::new(account_config.id.clone(), store, attachments, avatars, None);
                     account.ready.set(true);
                     opened.insert(account_config.id.clone(), account);
                     config.accounts.push(account_config);
@@ -774,7 +821,14 @@ impl Controller {
         };
         self.fetch_missing_attachments(&account, &chat.conversation, true);
         match self.message_views(&account, &chat.conversation) {
-            Ok(views) => self.ui.show_chat(chat, &views),
+            Ok(views) => {
+                let senders: HashSet<ConversationId> = views
+                    .iter()
+                    .filter_map(|v| v.sender.as_ref()?.seed.parse().ok())
+                    .collect();
+                self.fetch_avatars(&account, senders);
+                self.ui.show_chat(chat, &views);
+            }
             Err(err) => {
                 tracing::error!(%err, %chat, "loading messages failed");
                 self.ui.show_error("Could not load messages");
@@ -991,6 +1045,92 @@ impl Controller {
         self.schedule_refresh();
     }
 
+    /// Fetches the pictures of `subjects` that were never fetched or are
+    /// older than [`AVATAR_MAX_AGE`].
+    fn fetch_avatars(
+        &self,
+        account: &Rc<Account>,
+        subjects: impl IntoIterator<Item = ConversationId>,
+    ) {
+        if !account.ready.get() || account.backend.borrow().is_none() {
+            return;
+        }
+        let now = Timestamp(glib::real_time() / 1000);
+        let max_age = i64::try_from(AVATAR_MAX_AGE.as_millis()).unwrap_or(i64::MAX);
+        for subject in subjects {
+            let fresh = account
+                .avatars
+                .borrow()
+                .get(&subject)
+                .is_some_and(|a| now.0 - a.fetched_at.0 < max_age);
+            if fresh
+                || !account
+                    .avatars_fetching
+                    .borrow_mut()
+                    .insert(subject.clone())
+            {
+                continue;
+            }
+            if let Some(this) = self.weak_self.upgrade() {
+                glib::spawn_future_local(this.fetch_avatar(Rc::downgrade(account), subject, now));
+            }
+        }
+    }
+
+    async fn fetch_avatar(
+        self: Rc<Self>,
+        account: Weak<Account>,
+        subject: ConversationId,
+        now: Timestamp,
+    ) {
+        let file = avatar_file(&subject, now);
+        let Some(fetch) = self.live_account(&account).and_then(|account| {
+            let backend = account.backend.borrow();
+            Some(
+                backend
+                    .as_ref()?
+                    .fetch_avatar(&subject, account.avatars_dir.join(&file)),
+            )
+        }) else {
+            return;
+        };
+        let result = fetch.await;
+        // Removing the account deleted its files.
+        let Some(account) = self.live_account(&account) else {
+            return;
+        };
+        let has_picture = match result {
+            Ok(has_picture) => has_picture,
+            // Logged by the backend; stays marked as fetching until restart.
+            Err(_) => return,
+        };
+        account.avatars_fetching.borrow_mut().remove(&subject);
+        let avatar = StoredAvatar {
+            file: has_picture.then_some(file),
+            fetched_at: now,
+        };
+        match account.store.borrow_mut().set_avatar(&subject, &avatar) {
+            Ok(replaced) => {
+                if let Some(replaced) = replaced {
+                    remove_file(&account.avatars_dir.join(replaced));
+                }
+            }
+            Err(err) => {
+                tracing::error!(%err, "storing a picture failed");
+                return;
+            }
+        }
+        let changed = account
+            .avatars
+            .borrow_mut()
+            .insert(subject, avatar.clone())
+            .is_none_or(|old| old.file.is_some() || avatar.file.is_some());
+        if changed {
+            self.chat_dirty.set(true);
+            self.schedule_refresh();
+        }
+    }
+
     /// Applies one event from Signal to the account's store and the UI.
     fn apply(&self, account: &Rc<Account>, event: SignalEvent, origin: Origin) {
         if let SignalEvent::Message(message) = &event {
@@ -1125,6 +1265,16 @@ impl Controller {
         let chat = account.chat(message.conversation.clone()).to_string();
         let notification = gio::Notification::new(&title);
         notification.set_body(Some(&body));
+        // Who wrote: the contact, or in a group the sender, else the group.
+        let picture = match &message.author {
+            Author::Peer(peer) => account
+                .avatar(&ConversationId::Direct(peer.clone()))
+                .or_else(|| account.avatar(&message.conversation)),
+            Author::Me => None,
+        };
+        if let Some(path) = picture {
+            notification.set_icon(&gio::FileIcon::new(&gio::File::for_path(path)));
+        }
         notification.set_default_action_and_target_value(
             &format!("app.{OPEN_CONVERSATION_ACTION}"),
             Some(&chat.to_variant()),
@@ -1156,20 +1306,38 @@ impl Controller {
     fn refresh(&self) {
         let mut per_account = Vec::new();
         let mut unread = 0;
-        for account in self.accounts.borrow().values() {
-            let store = account.store.borrow();
-            match store.conversations() {
-                Ok(conversations) => per_account.push((account.id.clone(), conversations)),
+        let accounts: Vec<Rc<Account>> = self.accounts.borrow().values().cloned().collect();
+        for account in &accounts {
+            let conversations = account.store.borrow().conversations();
+            match conversations {
+                Ok(conversations) => {
+                    self.fetch_avatars(
+                        account,
+                        conversations
+                            .iter()
+                            .filter(|c| c.last_activity.is_some())
+                            .map(|c| c.id.clone()),
+                    );
+                    per_account.push((account.id.clone(), conversations));
+                }
                 Err(err) => {
                     tracing::error!(%err, account = %account.id, "loading conversations failed");
                 }
             }
+            let store = account.store.borrow();
             match store.total_unread() {
                 Ok(count) => unread += count,
                 Err(err) => tracing::error!(%err, account = %account.id, "counting unread failed"),
             }
         }
-        self.ui.set_conversations(merge_chats(per_account));
+        let mut chats = merge_chats(per_account);
+        for chat in &mut chats {
+            chat.avatar = accounts
+                .iter()
+                .find(|a| a.id == chat.account)
+                .and_then(|a| a.avatar(&chat.summary.id));
+        }
+        self.ui.set_conversations(chats);
         if let Some(tray) = &self.tray {
             tray.set_unread(unread);
         }
@@ -1203,12 +1371,18 @@ impl Controller {
                     ),
                     Author::Peer(peer) => {
                         let sender = is_group.then(|| {
-                            names
+                            let name = names
                                 .entry(peer.clone())
                                 .or_insert_with(|| {
                                     peer_display_name(&store, peer, m.author_name.as_deref())
                                 })
-                                .clone()
+                                .clone();
+                            let subject = ConversationId::Direct(peer.clone());
+                            AvatarView {
+                                path: account.avatar(&subject),
+                                name,
+                                seed: subject.to_string(),
+                            }
                         });
                         (MessageStatus::Incoming, sender)
                     }
@@ -1270,6 +1444,7 @@ fn merge_chats(per_account: Vec<(AccountId, Vec<ConversationSummary>)>) -> Vec<L
             conversations.into_iter().map(move |summary| ListedChat {
                 account: account.clone(),
                 summary,
+                avatar: None,
             })
         })
         .collect();

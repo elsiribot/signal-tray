@@ -10,7 +10,7 @@ use crate::config::{AccountConfig, Color};
 use crate::model::{
     AccountId, AttachmentKind, Author, ConversationId, NewAttachment, NewMessage, PeerId, Timestamp,
 };
-use crate::store::{ReadState, Store};
+use crate::store::{ReadState, Store, StoredAvatar};
 
 const MINUTE: i64 = 60_000;
 const HOUR: i64 = 60 * MINUTE;
@@ -201,7 +201,51 @@ fn populate_personal(store: &mut Store, images: &Path) -> anyhow::Result<()> {
         &[440.0, 554.0, 659.0],
         images,
     )?;
-    insert_voice(store, &bob, "bob", 30 * MINUTE, &[659.0, 554.0], images)
+    insert_voice(store, &bob, "bob", 30 * MINUTE, &[659.0, 554.0], images)?;
+    // Everyone else gets initials.
+    let avatars = images.join("avatars");
+    std::fs::create_dir_all(&avatars)?;
+    insert_avatar(store, &alice, [230, 140, 60], &avatars)?;
+    insert_avatar(store, &direct("mum"), [90, 160, 120], &avatars)
+}
+
+/// A generated picture: a light spot on a gradient of `rgb`.
+fn insert_avatar(
+    store: &mut Store,
+    subject: &ConversationId,
+    rgb: [u8; 3],
+    dir: &Path,
+) -> anyhow::Result<()> {
+    const SIZE: usize = 96;
+    let mut pixels = Vec::with_capacity(SIZE * SIZE * 3);
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let (dx, dy) = (x as f64 - 48.0, y as f64 - 40.0);
+            let spot = (1.0 - (dx * dx + dy * dy).sqrt() / 30.0).max(0.0);
+            let shade = 0.6 + 0.4 * (y as f64 / SIZE as f64);
+            for c in rgb {
+                let v = f64::from(c) * shade + (255.0 - f64::from(c) * shade) * spot;
+                pixels.push(v.round().clamp(0.0, 255.0) as u8);
+            }
+        }
+    }
+    let texture = gdk::MemoryTexture::new(
+        SIZE as i32,
+        SIZE as i32,
+        gdk::MemoryFormat::R8g8b8,
+        &glib::Bytes::from_owned(pixels),
+        SIZE * 3,
+    );
+    let file = format!("{}.png", subject.to_string().replace([':', '/'], "_"));
+    texture.save_to_png(dir.join(&file))?;
+    store.set_avatar(
+        subject,
+        &StoredAvatar {
+            file: Some(file),
+            fetched_at: Timestamp(glib::real_time() / 1000),
+        },
+    )?;
+    Ok(())
 }
 
 /// A generated voice message from `from`, downloaded but not played: a

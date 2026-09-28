@@ -3,6 +3,7 @@
 //! the controller gives it and reports user intent as [`UiEvent`]s.
 
 mod audio;
+mod avatar;
 mod format;
 mod images;
 mod placement;
@@ -10,6 +11,7 @@ pub mod settings;
 
 use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 
 use gtk::prelude::*;
@@ -21,6 +23,8 @@ use crate::model::{AccountId, ChatRef, DeliveryStatus, Timestamp};
 use crate::store::{AttachmentId, ConversationSummary};
 use audio::Player;
 pub use audio::{AudioState, AudioView};
+pub use avatar::AvatarView;
+use avatar::Avatars;
 use images::Thumbnails;
 pub use images::{ImageState, ImageView, StagedImage};
 pub use placement::Placement;
@@ -29,6 +33,10 @@ const CSS: &str = include_str!("style.css");
 
 /// How long error banners stay up.
 const BANNER_SECONDS: u32 = 8;
+/// Sizes of pictures, in logical pixels.
+const LIST_AVATAR: i32 = 28;
+const HEADER_AVATAR: i32 = 22;
+const SENDER_AVATAR: i32 = 24;
 /// Rows moved by PageUp/PageDown in the chat list.
 const LIST_PAGE_ROWS: i32 = 8;
 /// Upper bound of rows rendered while searching, to keep typing snappy
@@ -105,6 +113,8 @@ pub struct AccountView {
 pub struct ListedChat {
     pub account: AccountId,
     pub summary: ConversationSummary,
+    /// The picture, if there is one.
+    pub avatar: Option<PathBuf>,
 }
 
 impl ListedChat {
@@ -127,7 +137,7 @@ pub enum MessageStatus {
 pub struct MessageView {
     pub status: MessageStatus,
     /// Shown above incoming group messages.
-    pub sender: Option<String>,
+    pub sender: Option<AvatarView>,
     pub body: String,
     pub images: Vec<ImageView>,
     pub audio: Vec<AudioView>,
@@ -222,11 +232,13 @@ pub struct Ui {
     list_scroll: gtk::ScrolledWindow,
     list_empty: gtk::Label,
     chat_header: gtk::Box,
+    chat_avatar: gtk::Box,
     chat_title: gtk::Label,
     chat_account: gtk::Label,
     messages: gtk::ListBox,
     messages_scroll: gtk::ScrolledWindow,
     thumbnails: Rc<Thumbnails>,
+    avatars: Avatars,
     /// `None` if GStreamer is unavailable.
     player: Option<Rc<Player>>,
     staged_box: gtk::Box,
@@ -357,8 +369,10 @@ impl Ui {
             .ellipsize(pango::EllipsizeMode::End)
             .css_classes(["chat-account", "dim"])
             .build();
+        let chat_avatar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         let header = gtk::Box::builder().css_classes(["chat-header"]).build();
         header.append(&back);
+        header.append(&chat_avatar);
         header.append(&chat_title);
         header.append(&chat_account);
 
@@ -455,7 +469,9 @@ impl Ui {
             list_scroll,
             list_empty,
             chat_header: header,
+            chat_avatar,
             chat_title,
+            avatars: Avatars::default(),
             chat_account,
             messages,
             messages_scroll,
@@ -876,8 +892,11 @@ impl Ui {
 
         self.list_box.remove_all();
         for conversation in &matches {
-            self.list_box
-                .append(&conversation_row(conversation, several_accounts));
+            self.list_box.append(&conversation_row(
+                conversation,
+                several_accounts,
+                &self.avatars,
+            ));
         }
         let visible: Vec<ChatRef> = matches.iter().map(|c| c.chat()).collect();
         // A background refresh must not move the selection under the
@@ -996,13 +1015,25 @@ impl Ui {
 
     fn update_chat_title(&self, id: &ChatRef) {
         let state = self.state.borrow();
-        let name = state
+        let listed = state
             .conversations
             .iter()
-            .find(|c| c.account == id.account && c.summary.id == id.conversation)
-            .map(|c| c.summary.name.clone());
-        self.chat_title
-            .set_label(&name.unwrap_or_else(|| id.conversation.to_string()));
+            .find(|c| c.account == id.account && c.summary.id == id.conversation);
+        let name = listed
+            .map(|c| c.summary.name.clone())
+            .unwrap_or_else(|| id.conversation.to_string());
+        let avatar = AvatarView {
+            path: listed.and_then(|c| c.avatar.clone()),
+            name: name.clone(),
+            seed: id.conversation.to_string(),
+        };
+        while let Some(child) = self.chat_avatar.first_child() {
+            self.chat_avatar.remove(&child);
+        }
+        let avatar = self.avatars.widget(&avatar, HEADER_AVATAR);
+        avatar.add_css_class("header-avatar");
+        self.chat_avatar.append(&avatar);
+        self.chat_title.set_label(&name);
         let account = state
             .accounts
             .iter()
@@ -1068,12 +1099,18 @@ impl Ui {
         }
         let mut queue = Vec::new();
         let mut last_day = None;
+        // Of the previous message, if incoming in a group.
+        let mut last_sender: Option<&str> = None;
         for (index, message) in messages.iter().enumerate() {
             let day = format::day_key(message.timestamp);
             if day != last_day {
                 last_day = day;
+                last_sender = None;
                 self.messages.append(&day_separator(message.timestamp));
             }
+            let sender = message.sender.as_ref().map(|s| s.seed.as_str());
+            let starts_run = sender.is_some() && sender != last_sender;
+            last_sender = sender;
             let audio: Vec<gtk::Widget> = message
                 .audio
                 .iter()
@@ -1097,8 +1134,13 @@ impl Ui {
                     }
                 })
                 .collect();
-            self.messages
-                .append(&message_row(message, &account, &self.thumbnails, &audio));
+            self.messages.append(&message_row(
+                message,
+                &account,
+                &self.thumbnails,
+                &audio,
+                starts_run.then_some(&self.avatars),
+            ));
         }
         if let Some(player) = &self.player {
             player.set_queue(queue);
@@ -1126,7 +1168,7 @@ impl Ui {
             deleted: false,
         };
         self.messages
-            .append(&message_row(&view, account, &self.thumbnails, &[]));
+            .append(&message_row(&view, account, &self.thumbnails, &[], None));
     }
 
     /// Puts the text and images of a failed send back into the compose box.
@@ -1562,7 +1604,7 @@ fn account_css(accounts: &[AccountView]) -> String {
     css
 }
 
-fn conversation_row(chat: &ListedChat, show_account: bool) -> gtk::ListBoxRow {
+fn conversation_row(chat: &ListedChat, show_account: bool, avatars: &Avatars) -> gtk::ListBoxRow {
     let conversation = &chat.summary;
     let name = label(&conversation.name, &["name"]);
     name.set_ellipsize(pango::EllipsizeMode::End);
@@ -1614,6 +1656,16 @@ fn conversation_row(chat: &ListedChat, show_account: bool) -> gtk::ListBoxRow {
     if show_account {
         row.append(&gtk::Box::builder().css_classes(["stripe"]).build());
     }
+    let avatar = avatars.widget(
+        &AvatarView {
+            path: chat.avatar.clone(),
+            name: conversation.name.clone(),
+            seed: conversation.id.to_string(),
+        },
+        LIST_AVATAR,
+    );
+    avatar.add_css_class("list-avatar");
+    row.append(&avatar);
     row.append(&content);
     gtk::ListBoxRow::builder().child(&row).build()
 }
@@ -1630,12 +1682,15 @@ fn day_separator(ts: Timestamp) -> gtk::ListBoxRow {
         .build()
 }
 
-/// `audio` are the controls of the message's audio.
+/// `audio` are the controls of the message's audio. For the first
+/// message of a sender's run in a group, `avatars` is given to show who
+/// sent it; the others are indented to line up.
 fn message_row(
     message: &MessageView,
     account: &AccountId,
     thumbnails: &Rc<Thumbnails>,
     audio: &[gtk::Widget],
+    avatars: Option<&Avatars>,
 ) -> gtk::ListBoxRow {
     let outgoing = !matches!(message.status, MessageStatus::Incoming);
     let bubble = vbox(0);
@@ -1648,8 +1703,8 @@ fn message_row(
         gtk::Align::Start
     });
 
-    if let Some(sender) = &message.sender {
-        bubble.append(&label(sender, &["sender"]));
+    if let (Some(sender), Some(_)) = (&message.sender, avatars) {
+        bubble.append(&label(&sender.name, &["sender"]));
     }
 
     if message.deleted {
@@ -1691,8 +1746,29 @@ fn message_row(
     }
     bubble.append(&meta);
 
+    let child: gtk::Widget = match &message.sender {
+        Some(sender) => {
+            let row = gtk::Box::builder().css_classes(["from-sender"]).build();
+            match avatars {
+                Some(avatars) => {
+                    let avatar = avatars.widget(sender, SENDER_AVATAR);
+                    avatar.set_valign(gtk::Align::Start);
+                    avatar.add_css_class("sender-avatar");
+                    row.append(&avatar);
+                }
+                None => {
+                    let spacer = Avatars::spacer(SENDER_AVATAR);
+                    spacer.add_css_class("sender-avatar");
+                    row.append(&spacer);
+                }
+            }
+            row.append(&bubble);
+            row.upcast()
+        }
+        None => bubble.upcast(),
+    };
     gtk::ListBoxRow::builder()
-        .child(&bubble)
+        .child(&child)
         .activatable(false)
         .focusable(false)
         .build()
