@@ -37,6 +37,13 @@
           glib
           # SQLCipher (bundled via presage-store-sqlite) links libcrypto
           openssl
+          # Voice memos: the player library (bad), MP4 demuxing and the
+          # PulseAudio/PipeWire sink (good), AAC decoding (libav).
+          gst_all_1.gstreamer
+          gst_all_1.gst-plugins-base
+          gst_all_1.gst-plugins-good
+          gst_all_1.gst-plugins-bad
+          gst_all_1.gst-libav
         ];
 
         # Only what the build reads, so editing docs or the flake's other

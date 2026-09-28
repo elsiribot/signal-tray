@@ -193,6 +193,36 @@ searchentry.search {
   color: white;
 }
 
+/* audio */
+
+.audio {
+  margin: 2px 0;
+}
+
+.audio button.play {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+}
+
+.audio scale {
+  padding: 4px 6px;
+}
+
+/* No taller than the time next to it, so the bubble doesn't grow when it
+ * shows up. */
+.audio button.speed {
+  min-height: 0;
+  min-width: 0;
+  padding: 0 4px;
+  font-size: 0.82em;
+}
+
+.unplayed {
+  color: #3a76f0;
+  font-size: 0.6em;
+}
+
 .compose-box {
   margin: 4px 6px 6px 6px;
   border: 1px solid alpha(currentColor, 0.2);

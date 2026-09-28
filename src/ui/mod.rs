@@ -2,6 +2,7 @@
 //! keyboard-first navigation. The UI holds no Signal logic; it renders what
 //! the controller gives it and reports user intent as [`UiEvent`]s.
 
+mod audio;
 mod format;
 mod images;
 mod placement;
@@ -17,7 +18,9 @@ use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell as _};
 
 use crate::config::{Color, Config, Opacity};
 use crate::model::{AccountId, ChatRef, DeliveryStatus, Timestamp};
-use crate::store::ConversationSummary;
+use crate::store::{AttachmentId, ConversationSummary};
+use audio::Player;
+pub use audio::{AudioState, AudioView};
 use images::Thumbnails;
 pub use images::{ImageState, ImageView, StagedImage};
 pub use placement::Placement;
@@ -56,6 +59,17 @@ pub enum UiEvent {
     OpenSettings,
     /// The window was dragged to a new spot.
     Moved(Placement),
+    /// Audio was played for the first time.
+    Played {
+        account: AccountId,
+        id: AttachmentId,
+    },
+    /// The length of an audio attachment was found out.
+    AudioDuration {
+        account: AccountId,
+        id: AttachmentId,
+        duration: std::time::Duration,
+    },
     Quit,
 }
 
@@ -71,6 +85,8 @@ impl UiEvent {
             Self::CancelLink => "cancel-link",
             Self::OpenSettings => "open-settings",
             Self::Moved(_) => "moved",
+            Self::Played { .. } => "played",
+            Self::AudioDuration { .. } => "audio-duration",
             Self::Quit => "quit",
         }
     }
@@ -114,6 +130,7 @@ pub struct MessageView {
     pub sender: Option<String>,
     pub body: String,
     pub images: Vec<ImageView>,
+    pub audio: Vec<AudioView>,
     pub timestamp: Timestamp,
     pub edited: bool,
     pub deleted: bool,
@@ -210,6 +227,8 @@ pub struct Ui {
     messages: gtk::ListBox,
     messages_scroll: gtk::ScrolledWindow,
     thumbnails: Rc<Thumbnails>,
+    /// `None` if GStreamer is unavailable.
+    player: Option<Rc<Player>>,
     staged_box: gtk::Box,
     compose: gtk::TextView,
     compose_placeholder: gtk::Label,
@@ -441,6 +460,14 @@ impl Ui {
             messages,
             messages_scroll,
             thumbnails: Rc::default(),
+            player: {
+                let weak_ui = weak_self.clone();
+                Player::new(events.clone(), move |err| {
+                    if let Some(ui) = weak_ui.upgrade() {
+                        ui.show_error(err);
+                    }
+                })
+            },
             staged_box,
             compose,
             compose_placeholder,
@@ -1036,15 +1063,45 @@ impl Ui {
         let Some(account) = self.current_chat().map(|c| c.account) else {
             return;
         };
+        if let Some(player) = &self.player {
+            player.begin_render();
+        }
+        let mut queue = Vec::new();
         let mut last_day = None;
-        for message in messages {
+        for (index, message) in messages.iter().enumerate() {
             let day = format::day_key(message.timestamp);
             if day != last_day {
                 last_day = day;
                 self.messages.append(&day_separator(message.timestamp));
             }
+            let audio: Vec<gtk::Widget> = message
+                .audio
+                .iter()
+                .filter(|_| !message.deleted)
+                .map(|view| {
+                    queue.push(audio::Queued {
+                        key: audio::Key {
+                            account: account.clone(),
+                            id: view.id,
+                        },
+                        message: index,
+                        path: match &view.state {
+                            AudioState::Ready(path) => Some(path.clone()),
+                            AudioState::Loading | AudioState::Unavailable => None,
+                        },
+                        played: view.played,
+                    });
+                    match &self.player {
+                        Some(player) => player.controls(&account, view),
+                        None => label("🎤 Voice message (can't be played)", &["dim"]).upcast(),
+                    }
+                })
+                .collect();
             self.messages
-                .append(&message_row(message, &account, &self.thumbnails));
+                .append(&message_row(message, &account, &self.thumbnails, &audio));
+        }
+        if let Some(player) = &self.player {
+            player.set_queue(queue);
         }
     }
 
@@ -1054,6 +1111,7 @@ impl Ui {
             status: MessageStatus::Pending,
             sender: None,
             body: text.to_owned(),
+            audio: Vec::new(),
             images: images
                 .iter()
                 .map(|staged| ImageView {
@@ -1068,7 +1126,7 @@ impl Ui {
             deleted: false,
         };
         self.messages
-            .append(&message_row(&view, account, &self.thumbnails));
+            .append(&message_row(&view, account, &self.thumbnails, &[]));
     }
 
     /// Puts the text and images of a failed send back into the compose box.
@@ -1388,6 +1446,11 @@ impl Ui {
             gdk::Key::Return | gdk::Key::KP_Enter if plain => self.send_compose(),
             gdk::Key::v if ctrl => return self.paste_images(),
             gdk::Key::o if ctrl => self.choose_images(),
+            gdk::Key::space if ctrl => {
+                if let Some(player) = &self.player {
+                    player.toggle_in_chat();
+                }
+            }
             gdk::Key::BackSpace
                 if plain
                     && self.compose.buffer().char_count() == 0
@@ -1566,10 +1629,12 @@ fn day_separator(ts: Timestamp) -> gtk::ListBoxRow {
         .build()
 }
 
+/// `audio` are the controls of the message's audio.
 fn message_row(
     message: &MessageView,
     account: &AccountId,
     thumbnails: &Rc<Thumbnails>,
+    audio: &[gtk::Widget],
 ) -> gtk::ListBoxRow {
     let outgoing = !matches!(message.status, MessageStatus::Incoming);
     let bubble = vbox(0);
@@ -1592,7 +1657,10 @@ fn message_row(
         for image in &message.images {
             bubble.append(&thumbnails.widget(image));
         }
-        if !message.body.is_empty() || message.images.is_empty() {
+        for controls in audio {
+            bubble.append(controls);
+        }
+        if !message.body.is_empty() || (message.images.is_empty() && audio.is_empty()) {
             let body = label(&message.body, &["body"]);
             body.set_wrap(true);
             body.set_wrap_mode(pango::WrapMode::WordChar);
@@ -1649,6 +1717,7 @@ fn help_page() -> gtk::ScrolledWindow {
         ("Ctrl+V", "paste image"),
         ("Ctrl+O", "send images"),
         ("Backspace", "remove last image"),
+        ("Ctrl+Space", "play / pause voice message"),
         ("Alt+↑ ↓", "previous / next chat"),
         ("PgUp PgDn", "scroll history"),
         ("Ctrl+.", "emoji"),

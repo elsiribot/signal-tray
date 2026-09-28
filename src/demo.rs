@@ -8,7 +8,7 @@ use gtk::{gdk, glib};
 
 use crate::config::{AccountConfig, Color};
 use crate::model::{
-    AccountId, Author, ConversationId, NewAttachment, NewMessage, PeerId, Timestamp,
+    AccountId, AttachmentKind, Author, ConversationId, NewAttachment, NewMessage, PeerId, Timestamp,
 };
 use crate::store::{ReadState, Store};
 
@@ -191,7 +191,91 @@ fn populate_personal(store: &mut Store, images: &Path) -> anyhow::Result<()> {
         ),
     ];
     insert(store, messages)?;
-    insert_photo(store, &carol, "carol", 26 * HOUR, images)
+    insert_photo(store, &carol, "carol", 26 * HOUR, images)?;
+    // Two in a row, so the second plays after the first.
+    insert_voice(
+        store,
+        &bob,
+        "bob",
+        31 * MINUTE,
+        &[440.0, 554.0, 659.0],
+        images,
+    )?;
+    insert_voice(store, &bob, "bob", 30 * MINUTE, &[659.0, 554.0], images)
+}
+
+/// A generated voice message from `from`, downloaded but not played: a
+/// beep per tone, 0.6 s each.
+fn insert_voice(
+    store: &mut Store,
+    conversation: &ConversationId,
+    from: &str,
+    age: i64,
+    tones: &[f64],
+    dir: &Path,
+) -> anyhow::Result<()> {
+    let timestamp = Timestamp(glib::real_time() / 1000 - age);
+    let author = Author::Peer(peer(from));
+    store.insert_message(
+        &NewMessage {
+            conversation: conversation.clone(),
+            author: author.clone(),
+            author_name: Some(capitalize(from)),
+            timestamp,
+            body: String::new(),
+            attachments: vec![NewAttachment {
+                kind: AttachmentKind::Voice,
+                content_type: "audio/wav".into(),
+                file_name: None,
+                width: None,
+                height: None,
+                pointer: Vec::new(),
+            }],
+            expires_in: None,
+        },
+        ReadState::Unread,
+    )?;
+    let wav = beeps(tones);
+    for id in store.message_attachments(conversation, &author, timestamp)? {
+        let file = format!("{}.wav", id.0);
+        std::fs::write(dir.join(&file), &wav)?;
+        store.set_attachment_file(id, &file)?;
+    }
+    Ok(())
+}
+
+/// A mono 16 kHz, 16-bit WAV file.
+fn beeps(tones: &[f64]) -> Vec<u8> {
+    const RATE: u32 = 16_000;
+    const TONE: usize = RATE as usize * 6 / 10;
+    let mut samples = Vec::with_capacity(tones.len() * TONE);
+    for tone in tones {
+        for i in 0..TONE {
+            let t = i as f64 / f64::from(RATE);
+            // Fades in and out, so tones don't click.
+            let envelope = (std::f64::consts::PI * i as f64 / TONE as f64).sin();
+            let sample = (2.0 * std::f64::consts::PI * tone * t).sin() * envelope * 0.3;
+            samples.push((sample * f64::from(i16::MAX)) as i16);
+        }
+    }
+    let data_len = u32::try_from(samples.len() * 2).expect("seconds of audio fit");
+    let mut wav = Vec::with_capacity(44 + samples.len() * 2);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * 2).to_le_bytes()); // bytes per second
+    wav.extend_from_slice(&2u16.to_le_bytes()); // bytes per frame
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    for sample in samples {
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
 }
 
 /// A generated "photo" from `from`, already downloaded.
@@ -214,6 +298,7 @@ fn insert_photo(
             timestamp,
             body: String::new(),
             attachments: vec![NewAttachment {
+                kind: AttachmentKind::Image,
                 content_type: "image/png".into(),
                 file_name: Some("IMG_2041.png".into()),
                 width: Some(WIDTH as u32),

@@ -14,6 +14,8 @@ touching the mouse.
   Clicking one opens that chat.
 - Images: received ones are shown inline (click to open in your image
   viewer); send them by pasting, dropping or picking files.
+- Voice messages play in the chat, at 1×, 1.5× or 2×; consecutive ones
+  play one after another. A dot marks those you haven't heard.
 - Read receipts, delivery ticks (✓ sent, ✓✓ delivered, bold ✓✓ read), edits,
   remote deletes, and sync with messages you send from your phone.
 - Several accounts side by side, their chats in one list. Each account has
@@ -42,8 +44,9 @@ As a flake input:
 environment.systemPackages = [ inputs.signal-tray.packages.${pkgs.system}.default ];
 ```
 
-Without Nix you need GTK 4.14+, gtk4-layer-shell, OpenSSL, protoc and a
-Rust toolchain: `cargo install --path .`
+Without Nix you need GTK 4.14+, gtk4-layer-shell, OpenSSL, protoc, a
+Rust toolchain, and GStreamer with its base, good, bad and libav plugins
+(for voice messages): `cargo install --path .`
 
 ### First start: linking
 
@@ -119,9 +122,14 @@ swaybar's `tray` or waybar's `tray` module.
 |           | `Ctrl+V`                         | paste text, or an image to send     |
 |           | `Ctrl+O`                         | pick images to send                 |
 |           | `Backspace` (empty message)      | remove the last image to send       |
+|           | `Ctrl+Space`                     | play / pause a voice message¹       |
 
 Search matches every contact and group, so it's also how you start a new
 conversation.
+
+¹ Pauses or resumes the one playing in the chat; otherwise plays the first
+you haven't heard, or the newest. Input methods that use `Ctrl+Space`
+(e.g. fcitx, IBus) take it first.
 
 ## Configuration
 
@@ -164,8 +172,8 @@ with:
   store). presage also writes each message there as it arrives; those
   copies are moved into `messages.sqlite` and deleted on the next start, so
   there's one long-lived copy of each message.
-- `attachments/`: received and sent images. An image is deleted along with
-  its message (remote deletes, disappearing messages).
+- `attachments/`: received and sent images, and received audio. They're
+  deleted along with their message (remote deletes, disappearing messages).
 
 Versions before multi-account support kept both files directly in
 `~/.local/share/signal-tray/`; they're moved into `accounts/1/` on the first
@@ -180,9 +188,10 @@ Message contents are not logged.
 
 ## Not in v1
 
-Attachments other than images (received ones show as `📎 name`), view-once
-media, reactions, typing indicators, voice/video, stickers (shown as
-`[sticker]`), changing a chat's disappearing-message timer.
+Attachments other than images and audio (received ones show as
+`📎 name`), recording voice messages, view-once media, reactions, typing
+indicators, calls, stickers (shown as `[sticker]`), changing a chat's
+disappearing-message timer.
 
 ## Development
 

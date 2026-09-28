@@ -9,7 +9,8 @@ use anyhow::Context as _;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::model::{
-    Author, ConversationId, DeliveryStatus, NewMessage, PeerId, Timestamp, text_with_images,
+    AttachmentKind, Author, ConversationId, DeliveryStatus, NewMessage, PeerId, Timestamp,
+    text_with_attachments,
 };
 
 /// How many messages of a conversation are loaded into the chat view.
@@ -48,11 +49,11 @@ CREATE INDEX IF NOT EXISTS messages_by_conversation ON messages (conversation, t
 CREATE INDEX IF NOT EXISTS messages_by_ts ON messages (ts);
 CREATE INDEX IF NOT EXISTS messages_by_expiry ON messages (expires_at)
     WHERE expires_at IS NOT NULL;
--- Images of messages. Deleted together with their message.
+-- Images and audio of messages. Deleted together with their message.
 CREATE TABLE IF NOT EXISTS attachments (
     id           INTEGER PRIMARY KEY,
     message_id   INTEGER NOT NULL,
-    -- position among the message's images
+    -- position among the message's attachments
     idx          INTEGER NOT NULL,
     content_type TEXT NOT NULL,
     file_name    TEXT,
@@ -65,6 +66,17 @@ CREATE TABLE IF NOT EXISTS attachments (
     UNIQUE (message_id, idx)
 );
 ";
+
+/// Columns added to `attachments` after it was introduced, with their
+/// definitions. Added to existing databases on open.
+const ATTACHMENT_COLUMNS: &[(&str, &str)] = &[
+    // AttachmentKind::as_str
+    ("kind", "TEXT NOT NULL DEFAULT 'image'"),
+    // audio only: whether it was listened to
+    ("played", "INTEGER NOT NULL DEFAULT 1"),
+    // audio only: length, NULL until probed
+    ("duration_ms", "INTEGER"),
+];
 
 #[derive(Clone, Debug)]
 pub struct ConversationSummary {
@@ -94,14 +106,19 @@ pub struct AttachmentId(pub i64);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredAttachment {
     pub id: AttachmentId,
+    pub kind: AttachmentKind,
     pub file_name: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
     /// Name in the attachments directory; `None` until downloaded.
     pub file: Option<String>,
+    /// For audio: listened to.
+    pub played: bool,
+    /// For audio, once probed.
+    pub duration: Option<Duration>,
 }
 
-/// An image that is yet to be downloaded.
+/// An attachment that is yet to be downloaded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MissingAttachment {
     pub id: AttachmentId,
@@ -113,7 +130,7 @@ pub struct MissingAttachment {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Purged {
     pub conversations: Vec<ConversationId>,
-    /// Downloaded images of the purged messages, to delete.
+    /// Downloaded attachments of the purged messages, to delete.
     pub files: Vec<String>,
 }
 
@@ -151,6 +168,8 @@ impl Store {
 
     fn init(conn: Connection) -> anyhow::Result<Self> {
         conn.execute_batch(SCHEMA).context("creating schema")?;
+        add_missing_columns(&conn, "attachments", ATTACHMENT_COLUMNS)
+            .context("upgrading schema")?;
         Ok(Self { conn })
     }
 
@@ -208,18 +227,23 @@ impl Store {
             let message_id = tx.last_insert_rowid();
             let mut stmt = tx.prepare(
                 "INSERT INTO attachments
-                     (message_id, idx, content_type, file_name, width, height, pointer)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     (message_id, idx, kind, content_type, file_name, width, height, pointer,
+                      played)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
-            for (idx, image) in (0i64..).zip(&msg.attachments) {
+            // What's read is taken as heard: history and our own messages.
+            let played = read == ReadState::Read;
+            for (idx, attachment) in (0i64..).zip(&msg.attachments) {
                 stmt.execute(params![
                     message_id,
                     idx,
-                    image.content_type,
-                    image.file_name,
-                    image.width,
-                    image.height,
-                    image.pointer,
+                    attachment.kind.as_str(),
+                    attachment.content_type,
+                    attachment.file_name,
+                    attachment.width,
+                    attachment.height,
+                    attachment.pointer,
+                    played,
                 ])?;
             }
             drop(stmt);
@@ -239,7 +263,10 @@ impl Store {
                 params![
                     conversation,
                     msg.timestamp.0,
-                    preview(&text_with_images(&msg.body, msg.attachments.len())),
+                    preview(&text_with_attachments(
+                        &msg.body,
+                        &msg.attachments.iter().map(|a| a.kind).collect::<Vec<_>>(),
+                    )),
                     unread_delta,
                     msg.expires_in.map(duration_secs),
                 ],
@@ -414,9 +441,9 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Records that an image was saved as `file`. Returns its conversation,
-    /// or `None` if the image is gone (its message was deleted meanwhile),
-    /// in which case the file should be deleted.
+    /// Records that an attachment was saved as `file`. Returns its
+    /// conversation, or `None` if the attachment is gone (its message was
+    /// deleted meanwhile), in which case the file should be deleted.
     pub fn set_attachment_file(
         &self,
         id: AttachmentId,
@@ -439,6 +466,22 @@ impl Store {
             })
             .transpose()?;
         Ok(conversation.map(|c| c.parse()).transpose()?)
+    }
+
+    /// Marks audio as listened to. Returns whether it wasn't before.
+    pub fn mark_played(&self, id: AttachmentId) -> anyhow::Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE attachments SET played = 1 WHERE id = ?1 AND played = 0",
+            params![id.0],
+        )? > 0)
+    }
+
+    pub fn set_duration(&self, id: AttachmentId, duration: Duration) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE attachments SET duration_ms = ?2 WHERE id = ?1",
+            params![id.0, duration_millis(duration)],
+        )?;
+        Ok(())
     }
 
     /// Marks everything in a conversation as read and returns the messages a
@@ -598,7 +641,8 @@ impl Store {
         conversation: &ConversationId,
     ) -> anyhow::Result<HashMap<i64, Vec<StoredAttachment>>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT a.message_id, a.id, a.file_name, a.width, a.height, a.file
+            "SELECT a.message_id, a.id, a.file_name, a.width, a.height, a.file, a.kind,
+                    a.played, a.duration_ms
              FROM attachments a
              JOIN (SELECT id FROM messages WHERE conversation = ?1
                    ORDER BY ts DESC LIMIT ?2) m ON a.message_id = m.id
@@ -613,13 +657,19 @@ impl Store {
                     width: row.get(3)?,
                     height: row.get(4)?,
                     file: row.get(5)?,
+                    kind: AttachmentKind::from_db(&row.get::<_, String>(6)?),
+                    played: row.get(7)?,
+                    duration: row
+                        .get::<_, Option<i64>>(8)?
+                        .and_then(|ms| u64::try_from(ms).ok())
+                        .map(Duration::from_millis),
                 },
             ))
         })?;
         let mut attachments: HashMap<i64, Vec<StoredAttachment>> = HashMap::new();
         for row in rows {
-            let (message_id, image) = row?;
-            attachments.entry(message_id).or_default().push(image);
+            let (message_id, attachment) = row?;
+            attachments.entry(message_id).or_default().push(attachment);
         }
         Ok(attachments)
     }
@@ -653,6 +703,25 @@ fn author_column(author: &Author) -> &str {
     }
 }
 
+fn add_missing_columns(
+    conn: &Connection,
+    table: &str,
+    columns: &[(&str, &str)],
+) -> rusqlite::Result<()> {
+    let existing: Vec<String> = conn
+        .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for (name, definition) in columns {
+        if !existing.iter().any(|e| e == name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {name} {definition}"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
 fn history_limit() -> i64 {
     i64::try_from(CHAT_HISTORY_LIMIT).expect("history limit fits in i64")
 }
@@ -675,29 +744,32 @@ fn delete_attachments(
 /// Re-derives a conversation's preview and unread count from its messages,
 /// after messages changed underneath them.
 fn recompute_summary(conn: &Connection, conversation: &str) -> rusqlite::Result<()> {
-    let latest: Option<(String, i64)> = conn
+    let latest: Option<(i64, String)> = conn
         .query_row(
-            "SELECT body, (SELECT COUNT(*) FROM attachments WHERE message_id = messages.id)
-             FROM messages WHERE conversation = ?1 AND deleted = 0
+            "SELECT id, body FROM messages WHERE conversation = ?1 AND deleted = 0
              ORDER BY ts DESC LIMIT 1",
             params![conversation],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
+    let latest = match latest {
+        Some((id, body)) => {
+            let kinds: Vec<AttachmentKind> = conn
+                .prepare_cached("SELECT kind FROM attachments WHERE message_id = ?1 ORDER BY idx")?
+                .query_map(params![id], |row| {
+                    Ok(AttachmentKind::from_db(&row.get::<_, String>(0)?))
+                })?
+                .collect::<Result<_, _>>()?;
+            Some(preview(&text_with_attachments(&body, &kinds)))
+        }
+        None => None,
+    };
     conn.execute(
         "UPDATE conversations SET
              last_preview = ?2,
              unread = (SELECT COUNT(*) FROM messages WHERE conversation = ?1 AND is_read = 0)
          WHERE id = ?1",
-        params![
-            conversation,
-            latest.map(|(body, images)| {
-                preview(&text_with_images(
-                    &body,
-                    usize::try_from(images).unwrap_or(0),
-                ))
-            })
-        ],
+        params![conversation, latest],
     )?;
     Ok(())
 }
@@ -749,6 +821,7 @@ mod tests {
 
     fn image(n: u8) -> NewAttachment {
         NewAttachment {
+            kind: AttachmentKind::Image,
             content_type: "image/jpeg".into(),
             file_name: Some(format!("{n}.jpg")),
             width: Some(640),
@@ -1066,6 +1139,92 @@ mod tests {
             None,
             "a late download of a deleted image is reported"
         );
+    }
+
+    #[test]
+    fn voice_messages_are_unplayed_until_played() {
+        let mut store = Store::open_in_memory().expect("in-memory db");
+        let alice = ConversationId::Direct(peer("alice"));
+        let voice = NewAttachment {
+            kind: AttachmentKind::Voice,
+            content_type: "audio/aac".into(),
+            width: None,
+            height: None,
+            ..image(1)
+        };
+        let live = NewMessage {
+            attachments: vec![voice.clone()],
+            ..incoming(&alice, "alice", 10, "")
+        };
+        let history = NewMessage {
+            attachments: vec![voice],
+            ..incoming(&alice, "alice", 5, "")
+        };
+        store
+            .insert_message(&live, ReadState::Unread)
+            .expect("insert");
+        store
+            .insert_message(&history, ReadState::Read)
+            .expect("insert");
+        assert_eq!(
+            store
+                .conversation(&alice)
+                .expect("query")
+                .expect("exists")
+                .last_preview
+                .as_deref(),
+            Some("🎤 Voice message")
+        );
+
+        let voices = |store: &Store| -> Vec<StoredAttachment> {
+            store
+                .messages(&alice)
+                .expect("messages")
+                .into_iter()
+                .flat_map(|m| m.attachments)
+                .collect()
+        };
+        let [old, new] = voices(&store).try_into().expect("two memos");
+        assert_eq!((old.kind, old.played), (AttachmentKind::Voice, true));
+        assert!(!new.played, "live messages start unplayed");
+        assert_eq!(new.duration, None);
+
+        assert!(store.mark_played(new.id).expect("mark played"));
+        assert!(
+            !store.mark_played(new.id).expect("mark played"),
+            "only once"
+        );
+        store
+            .set_duration(new.id, Duration::from_millis(4_250))
+            .expect("set duration");
+        let [_, new] = voices(&store).try_into().expect("two memos");
+        assert_eq!(
+            (new.played, new.duration),
+            (true, Some(Duration::from_millis(4_250)))
+        );
+    }
+
+    #[test]
+    fn attachments_of_older_databases_gain_the_new_columns() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE attachments (
+                 id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL, idx INTEGER NOT NULL,
+                 content_type TEXT NOT NULL, file_name TEXT, width INTEGER, height INTEGER,
+                 pointer BLOB NOT NULL, file TEXT, UNIQUE (message_id, idx));
+             INSERT INTO attachments (message_id, idx, content_type, pointer)
+                 VALUES (1, 0, 'image/png', x'00');",
+        )
+        .expect("old schema");
+        let store = Store::init(conn).expect("upgrade");
+        let (kind, played): (String, bool) = store
+            .conn
+            .query_row("SELECT kind, played FROM attachments", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("new columns");
+        assert_eq!((kind.as_str(), played), ("image", true));
+        drop(store);
     }
 
     #[test]

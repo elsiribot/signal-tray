@@ -27,6 +27,9 @@ futures = "0.3"
 base64 = { version = "0.22", default-features = false }
 uuid = { version = "1", default-features = false }
 url = "2"
+gstreamer = "0.25"
+gstreamer-play = "0.25"
+gstreamer-pbutils = "0.25"
 
 # presage's workspace patches don't propagate to dependents; mirror them.
 [dev-dependencies]

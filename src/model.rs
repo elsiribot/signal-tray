@@ -182,16 +182,59 @@ pub struct NewMessage {
     pub expires_in: Option<Duration>,
 }
 
-/// An image attached to a message, before it is downloaded.
+/// What an attachment shown in the app is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Image,
+    /// Audio recorded as a voice message.
+    Voice,
+    /// Any other audio.
+    Audio,
+}
+
+impl AttachmentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Voice => "voice",
+            Self::Audio => "audio",
+        }
+    }
+
+    /// Unknown kinds (from a newer version) are treated as images, which
+    /// at worst show as a link to the file.
+    pub fn from_db(kind: &str) -> Self {
+        match kind {
+            "voice" => Self::Voice,
+            "audio" => Self::Audio,
+            _ => Self::Image,
+        }
+    }
+
+    pub fn is_audio(self) -> bool {
+        matches!(self, Self::Voice | Self::Audio)
+    }
+
+    fn emoji(self) -> &'static str {
+        match self {
+            Self::Image => "🖼",
+            Self::Voice => "🎤",
+            Self::Audio => "🎵",
+        }
+    }
+}
+
+/// An image or audio clip attached to a message, before it is downloaded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewAttachment {
-    /// A MIME type, `image/…`.
+    pub kind: AttachmentKind,
+    /// A MIME type, `image/…` or `audio/…`.
     pub content_type: String,
     pub file_name: Option<String>,
     pub width: Option<u32>,
     pub height: Option<u32>,
-    /// Signal's protobuf-encoded `AttachmentPointer`: where the image is
-    /// and how to decrypt it. Opaque outside the backend.
+    /// Signal's protobuf-encoded `AttachmentPointer`: where the attachment
+    /// is and how to decrypt it. Opaque outside the backend.
     pub pointer: Vec<u8>,
 }
 
@@ -207,19 +250,39 @@ pub struct OutgoingImage {
 }
 
 /// A message as one piece of text, for the chat list and notifications:
-/// the body, marked when images are attached.
-pub fn text_with_images(body: &str, images: usize) -> String {
-    match (images, body.is_empty()) {
-        (0, _) => body.to_owned(),
-        (1, true) => "🖼 Photo".to_owned(),
-        (n, true) => format!("🖼 {n} photos"),
-        (_, false) => format!("🖼 {body}"),
+/// the body, marked with what is attached (`kinds`, in order).
+pub fn text_with_attachments(body: &str, kinds: &[AttachmentKind]) -> String {
+    let Some(first) = kinds.first() else {
+        return body.to_owned();
+    };
+    if !body.is_empty() {
+        return format!("{} {body}", first.emoji());
+    }
+    match first {
+        AttachmentKind::Image => match kinds
+            .iter()
+            .filter(|k| **k == AttachmentKind::Image)
+            .count()
+        {
+            1 => "🖼 Photo".to_owned(),
+            n => format!("🖼 {n} photos"),
+        },
+        AttachmentKind::Voice => "🎤 Voice message".to_owned(),
+        AttachmentKind::Audio => "🎵 Audio".to_owned(),
     }
 }
 
-/// File name extension for an image's MIME type.
+/// File name extension for an attachment's MIME type. Only for people
+/// opening the files; players and decoders look at the content.
 pub fn file_extension(content_type: &str) -> &'static str {
     match content_type {
+        "audio/aac" => "aac",
+        "audio/mp4" | "audio/x-m4a" => "m4a",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/flac" => "flac",
+        "audio/webm" => "webm",
         "image/jpeg" => "jpg",
         "image/png" => "png",
         "image/gif" => "gif",
@@ -230,6 +293,7 @@ pub fn file_extension(content_type: &str) -> &'static str {
         "image/bmp" => "bmp",
         "image/tiff" => "tiff",
         "image/svg+xml" => "svg",
+        t if t.starts_with("audio/") => "audio",
         _ => "img",
     }
 }
@@ -324,11 +388,18 @@ mod tests {
     }
 
     #[test]
-    fn images_are_marked_in_text() {
-        assert_eq!(text_with_images("hi", 0), "hi");
-        assert_eq!(text_with_images("", 1), "🖼 Photo");
-        assert_eq!(text_with_images("", 3), "🖼 3 photos");
-        assert_eq!(text_with_images("look", 2), "🖼 look");
+    fn attachments_are_marked_in_text() {
+        use AttachmentKind::{Audio, Image, Voice};
+        assert_eq!(text_with_attachments("hi", &[]), "hi");
+        assert_eq!(text_with_attachments("", &[Image]), "🖼 Photo");
+        assert_eq!(text_with_attachments("", &[Image; 3]), "🖼 3 photos");
+        assert_eq!(text_with_attachments("look", &[Image, Image]), "🖼 look");
+        assert_eq!(text_with_attachments("", &[Voice]), "🎤 Voice message");
+        assert_eq!(text_with_attachments("listen", &[Voice]), "🎤 listen");
+        assert_eq!(text_with_attachments("", &[Audio]), "🎵 Audio");
+        for kind in [Image, Voice, Audio] {
+            assert_eq!(AttachmentKind::from_db(kind.as_str()), kind);
+        }
     }
 
     #[test]

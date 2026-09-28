@@ -11,6 +11,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use presage::libsignal_service::content::{Content, ContentBody};
 use presage::libsignal_service::prelude::ProtobufMessage as _;
 use presage::libsignal_service::protocol::ServiceId;
+use presage::proto::attachment_pointer::Flags as AttachmentFlags;
 use presage::proto::body_range::AssociatedValue;
 use presage::proto::data_message::Flags;
 use presage::proto::receipt_message::Type as ReceiptType;
@@ -18,8 +19,8 @@ use presage::proto::sync_message::{self, Sent};
 use presage::proto::{AttachmentPointer, DataMessage, EditMessage, ReceiptMessage, SyncMessage};
 
 use crate::model::{
-    Author, ConversationId, DeliveryStatus, NewAttachment, NewMessage, PeerId, SignalEvent,
-    Timestamp,
+    AttachmentKind, Author, ConversationId, DeliveryStatus, NewAttachment, NewMessage, PeerId,
+    SignalEvent, Timestamp,
 };
 
 /// Display names used to render @mentions.
@@ -249,11 +250,22 @@ fn expires_in(data: &DataMessage) -> Option<Duration> {
         .map(|s| Duration::from_secs(s.into()))
 }
 
-fn is_image(attachment: &AttachmentPointer) -> bool {
-    attachment
-        .content_type
-        .as_deref()
-        .is_some_and(|t| t.starts_with("image/"))
+/// How an attachment is shown in the app; `None` for those only named in
+/// the text.
+fn inline_kind(attachment: &AttachmentPointer) -> Option<AttachmentKind> {
+    let content_type = attachment.content_type.as_deref()?;
+    if content_type.starts_with("image/") {
+        Some(AttachmentKind::Image)
+    } else if content_type.starts_with("audio/") {
+        let voice = attachment.flags.unwrap_or_default() & AttachmentFlags::VoiceMessage as u32;
+        Some(if voice != 0 {
+            AttachmentKind::Voice
+        } else {
+            AttachmentKind::Audio
+        })
+    } else {
+        None
+    }
 }
 
 /// View-once media is for the phone; it's neither downloaded nor shown.
@@ -261,15 +273,16 @@ fn is_view_once(data: &DataMessage) -> bool {
     data.is_view_once == Some(true)
 }
 
-/// The image attachments, to be downloaded and shown inline.
+/// The images and audio, to be downloaded and shown inline.
 fn inline_attachments(data: &DataMessage) -> Vec<NewAttachment> {
     if is_view_once(data) {
         return Vec::new();
     }
     data.attachments
         .iter()
-        .filter(|a| is_image(a))
-        .map(|a| NewAttachment {
+        .filter_map(|a| Some((inline_kind(a)?, a)))
+        .map(|(kind, a)| NewAttachment {
+            kind,
             content_type: a.content_type.clone().unwrap_or_default(),
             file_name: a.file_name.clone().filter(|n| !n.is_empty()),
             width: a.width.filter(|w| *w > 0),
@@ -279,8 +292,8 @@ fn inline_attachments(data: &DataMessage) -> Vec<NewAttachment> {
         .collect()
 }
 
-/// Flattens text, mentions, quotes and non-image attachments into plain
-/// text.
+/// Flattens text, mentions, quotes and the attachments that aren't shown
+/// inline into plain text.
 fn render_body(data: &DataMessage, names: &Names) -> String {
     let mut lines = Vec::new();
     if let Some(text) = data.quote.as_ref().and_then(|q| q.text.as_deref()) {
@@ -297,7 +310,7 @@ fn render_body(data: &DataMessage, names: &Names) -> String {
         lines.push("[view-once media]".to_owned());
         return lines.join("\n");
     }
-    for attachment in data.attachments.iter().filter(|a| !is_image(a)) {
+    for attachment in data.attachments.iter().filter(|a| inline_kind(a).is_none()) {
         let name = attachment
             .file_name
             .as_deref()
@@ -595,6 +608,7 @@ mod tests {
         assert_eq!(
             msg.attachments,
             vec![NewAttachment {
+                kind: AttachmentKind::Image,
                 content_type: "image/jpeg".into(),
                 file_name: Some("IMG_1.jpg".into()),
                 width: Some(640),
@@ -639,6 +653,34 @@ mod tests {
             (msg.body.as_str(), msg.attachments.len()),
             ("[view-once media]", 0)
         );
+    }
+
+    #[test]
+    fn audio_attachments_are_voice_messages_by_their_flag() {
+        let audio = |flags| AttachmentPointer {
+            content_type: Some("audio/aac".into()),
+            flags,
+            ..Default::default()
+        };
+        let data = DataMessage {
+            timestamp: Some(3),
+            attachments: vec![
+                audio(Some(AttachmentFlags::VoiceMessage as u32)),
+                audio(None),
+            ],
+            ..Default::default()
+        };
+        let events = content_events(
+            &content(ALICE, ContentBody::DataMessage(data)),
+            Source::Live,
+            &Names::new(),
+        );
+        let [SignalEvent::Message(msg)] = events.as_slice() else {
+            panic!("expected one message, got {events:?}");
+        };
+        let kinds: Vec<_> = msg.attachments.iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, [AttachmentKind::Voice, AttachmentKind::Audio]);
+        assert_eq!(msg.body, "", "shown inline, not named in the text");
     }
 
     #[test]

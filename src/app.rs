@@ -17,16 +17,16 @@ use gtk::{gio, glib};
 use crate::accounts;
 use crate::config::{self, AccountConfig, Config};
 use crate::model::{
-    self, AccountId, Author, ChatRef, ConversationId, NewAttachment, NewMessage, PeerId,
-    SignalEvent, Timestamp,
+    self, AccountId, AttachmentKind, Author, ChatRef, ConversationId, NewAttachment, NewMessage,
+    PeerId, SignalEvent, Timestamp,
 };
 use crate::signal::{self, Backend, Connection, Event, HistoryStatus, Origin, SendError};
 use crate::store::{AttachmentId, ConversationSummary, MissingAttachment, ReadState, Store};
 use crate::tray::{self, TrayAction, TrayHandle};
 use crate::ui::settings::{Setting, Settings};
 use crate::ui::{
-    AccountView, ImageState, ImageView, LinkState, ListedChat, MessageStatus, MessageView,
-    StagedImage, Status, Ui, UiEvent,
+    AccountView, AudioState, AudioView, ImageState, ImageView, LinkState, ListedChat,
+    MessageStatus, MessageView, StagedImage, Status, Ui, UiEvent,
 };
 
 /// How often disappearing messages are checked for expiry.
@@ -567,6 +567,24 @@ impl Controller {
                     }
                     self.save_config();
                 }
+                UiEvent::Played { account, id } => {
+                    if let Some(account) = self.account(&account)
+                        && let Err(err) = account.store.borrow().mark_played(id)
+                    {
+                        tracing::error!(%err, "marking audio played failed");
+                    }
+                }
+                UiEvent::AudioDuration {
+                    account,
+                    id,
+                    duration,
+                } => {
+                    if let Some(account) = self.account(&account)
+                        && let Err(err) = account.store.borrow().set_duration(id, duration)
+                    {
+                        tracing::error!(%err, "storing an audio duration failed");
+                    }
+                }
                 UiEvent::Quit => self.app.quit(),
             }
         }
@@ -855,6 +873,7 @@ impl Controller {
                 .iter()
                 .zip(pointers)
                 .map(|(staged, pointer)| NewAttachment {
+                    kind: AttachmentKind::Image,
                     content_type: staged.image.content_type.clone(),
                     file_name: staged.image.file_name.clone(),
                     width: staged.image.width,
@@ -1088,7 +1107,8 @@ impl Controller {
             Ok(Some(summary)) => summary.name,
             _ => "Signal".to_owned(),
         };
-        let text = model::text_with_images(&message.body, message.attachments.len());
+        let kinds: Vec<AttachmentKind> = message.attachments.iter().map(|a| a.kind).collect();
+        let text = model::text_with_attachments(&message.body, &kinds);
         let body = match (&message.conversation, &message.author) {
             (ConversationId::Group(_), Author::Peer(peer)) => {
                 format!(
@@ -1193,27 +1213,45 @@ impl Controller {
                         (MessageStatus::Incoming, sender)
                     }
                 };
-                let images = m
-                    .attachments
-                    .into_iter()
-                    .map(|image| ImageView {
-                        state: match &image.file {
-                            Some(file) => ImageState::Ready(account.attachments.join(file)),
-                            None if account.failed.borrow().contains(&image.id) => {
-                                ImageState::Unavailable
-                            }
-                            None => ImageState::Loading,
-                        },
-                        file_name: image.file_name,
-                        width: image.width,
-                        height: image.height,
-                    })
-                    .collect();
+                let (mut images, mut audio) = (Vec::new(), Vec::new());
+                for attachment in m.attachments {
+                    let path = attachment
+                        .file
+                        .as_ref()
+                        .map(|f| account.attachments.join(f));
+                    let failed = account.failed.borrow().contains(&attachment.id);
+                    if attachment.kind.is_audio() {
+                        audio.push(AudioView {
+                            id: attachment.id,
+                            state: match path {
+                                Some(path) => AudioState::Ready(path),
+                                None if failed => AudioState::Unavailable,
+                                None => AudioState::Loading,
+                            },
+                            voice: attachment.kind == AttachmentKind::Voice,
+                            file_name: attachment.file_name,
+                            played: attachment.played,
+                            duration: attachment.duration,
+                        });
+                    } else {
+                        images.push(ImageView {
+                            state: match path {
+                                Some(path) => ImageState::Ready(path),
+                                None if failed => ImageState::Unavailable,
+                                None => ImageState::Loading,
+                            },
+                            file_name: attachment.file_name,
+                            width: attachment.width,
+                            height: attachment.height,
+                        });
+                    }
+                }
                 MessageView {
                     status,
                     sender,
                     body: m.body,
                     images,
+                    audio,
                     timestamp: m.timestamp,
                     edited: m.edited,
                     deleted: m.deleted,
