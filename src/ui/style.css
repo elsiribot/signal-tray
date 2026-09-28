@@ -79,8 +79,11 @@ searchentry.search {
 .badge {
   font-size: 0.78em;
   font-weight: bold;
-  min-width: 14px;
-  padding: 0 4px;
+  /* A 16px circle for one digit, a pill for more. GTK's min-width
+   * excludes the padding. */
+  min-width: 10px;
+  min-height: 16px;
+  padding: 0 3px;
   border-radius: 8px;
   background: #3a76f0;
   color: white;

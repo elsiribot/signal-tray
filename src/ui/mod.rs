@@ -1592,6 +1592,7 @@ fn conversation_row(chat: &ListedChat, show_account: bool) -> gtk::ListBoxRow {
     if conversation.unread > 0 {
         let badge = label(&conversation.unread.to_string(), &["badge"]);
         badge.set_valign(gtk::Align::Center);
+        badge.set_xalign(0.5);
         bottom.append(&badge);
     }
 
